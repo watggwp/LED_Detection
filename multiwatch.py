@@ -276,6 +276,12 @@ def cmd_run(args):
             if not ok:
                 time.sleep(0.1)
                 continue
+            if args.flip_x and args.flip_y:
+                frame = cv2.flip(frame, -1)
+            elif args.flip_x:
+                frame = cv2.flip(frame, 1)
+            elif args.flip_y:
+                frame = cv2.flip(frame, 0)
             now = time.time()
             status = watch.update(frame, now, with_cct=(now - last_report >= args.interval))
             if args.show:
@@ -322,6 +328,8 @@ def main():
     r.add_argument("--rel", type=float, default=DETECT_REL,
                    help=f"เกณฑ์ detection สัดส่วนของความสว่างสูงสุด (default {DETECT_REL})")
     r.add_argument("--interval", type=float, default=1.0)
+    r.add_argument("--flip-x", action="store_true", help="กลับภาพแนวนอน (ซ้าย-ขวา)")
+    r.add_argument("--flip-y", action="store_true", help="กลับภาพแนวตั้ง (บน-ล่าง)")
     r.add_argument("--json", action="store_true")
     r.add_argument("--show", action="store_true")
     r.set_defaults(func=cmd_run)

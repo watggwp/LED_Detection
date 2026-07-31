@@ -242,6 +242,7 @@ class Session:
     """สถานะกล้อง+การตรวจ — กล้องเปิดเมื่อมีคนดู/ตรวจ, ปล่อยเองตอน idle (D11)"""
 
     def __init__(self):
+        cfg = load_config()
         self.lock = threading.Lock()
         self.thread = None
         self.stop_flag = False
@@ -255,6 +256,8 @@ class Session:
         self.reference = load_reference()  # b* ขาวอ้างอิง (คงไว้ข้าม start/stop)
         self.last_stream = time.time()     # เวลาเฟรมล่าสุดที่ stream ถูกดึง (D11)
         self.cam_error = None
+        self.flip_x = cfg.get("flip_x", False)  # กลับภาพแนวนอน (ซ้าย-ขวา)
+        self.flip_y = cfg.get("flip_y", False)  # กลับภาพแนวตั้ง (บน-ล่าง)
         # คิวคำสั่งตั้ง exposure ฝั่ง OpenCV (ต้องทำใน capture thread ที่ถือ cap)
         self.exp_pending = False
         self.exp_value = None
@@ -304,10 +307,19 @@ def capture_loop(ses):
             if not ok:
                 time.sleep(0.1)
                 continue
+            with ses.lock:
+                fx, fy = ses.flip_x, ses.flip_y
+            if fx and fy:
+                frame = cv2.flip(frame, -1)
+            elif fx:
+                frame = cv2.flip(frame, 1)
+            elif fy:
+                frame = cv2.flip(frame, 0)
+
             now = time.time()
             with ses.lock:
                 engine = ses.engine
-                ses.frame = frame.copy()  # เก็บเฟรมดิบไว้ให้ calibrate
+                ses.frame = frame.copy()  # เก็บเฟรมดิบไว้ให้ calibrate (เป็นเฟรมที่กลับด้านแล้ว)
                 idle = (now - ses.last_stream)
             # D11: ไม่ได้ตรวจ + ไม่มีคนดู stream นานเกิน → ปล่อยกล้อง
             if engine is None and idle > IDLE_RELEASE_SEC:
@@ -366,7 +378,26 @@ class CamReq(BaseModel):
     index: int
 
 
+class FlipReq(BaseModel):
+    flip_x: Optional[bool] = None
+    flip_y: Optional[bool] = None
+
+
 # ---------- endpoints ----------
+
+@app.post("/api/flip")
+def api_flip(req: FlipReq):
+    with SES.lock:
+        if req.flip_x is not None:
+            SES.flip_x = req.flip_x
+        if req.flip_y is not None:
+            SES.flip_y = req.flip_y
+        cfg = load_config()
+        cfg["flip_x"] = SES.flip_x
+        cfg["flip_y"] = SES.flip_y
+        save_config(cfg)
+        fx, fy = SES.flip_x, SES.flip_y
+    return {"ok": True, "flip_x": fx, "flip_y": fy}
 
 @app.post("/api/exposure")
 def api_exposure(req: ExposureReq):
@@ -488,11 +519,12 @@ def api_status():
         st = SES.status
         detecting = SES.detecting()
         cam_error = SES.cam_error
+        fx, fy = SES.flip_x, SES.flip_y
     if not detecting:
         return {"running": False, "preview": True, "cam_error": cam_error,
-                "thresh": THRESH}
+                "thresh": THRESH, "flip_x": fx, "flip_y": fy}
     out = {"running": True, "pieces": SES.pieces, "per_piece": SES.per_piece,
-           "max_spots": MAX_SPOTS, "thresh": THRESH}
+           "max_spots": MAX_SPOTS, "thresh": THRESH, "flip_x": fx, "flip_y": fy}
     if st is None:
         out["error"] = "กำลังเริ่มตรวจ..."
         return out
@@ -602,6 +634,11 @@ PAGE = """<!doctype html>
         <span class="hint">ภาพฟุ้งขาว? กด “มืดลง” จนเห็นแต่ดวงไฟบนพื้นดำ</span>
       </div>
       <div style="margin-top:10px">
+        <span style="font-weight:600">🔄 กลับภาพกล้อง:</span>
+        <button id="btnFlipX" onclick="toggleFlip('x')" style="background:#3a4250;color:#fff">↔ กลับซ้าย-ขวา (แกน X)</button>
+        <button id="btnFlipY" onclick="toggleFlip('y')" style="background:#3a4250;color:#fff">↕ กลับบน-ล่าง (แกน Y)</button>
+      </div>
+      <div style="margin-top:10px">
         <button onclick="calibrate()" style="background:#7b5dbe;color:#fff">🎯 Calibrate ขาว (วางชิ้นดีให้ครบก่อนกด)</button>
         <button onclick="clearCalib()">ล้างอ้างอิง</button>
         <span id="calinfo" class="hint"></span>
@@ -684,12 +721,47 @@ async function applyExp(v) {
 function darker()   { expLevel = Math.max(1, Math.round(expLevel / 2));   applyExp(expLevel); }
 function brighter() { expLevel = Math.min(1000, Math.max(2, expLevel * 2)); applyExp(expLevel); }
 async function autoExp() { expLevel = 5; await applyExp(null); }
+
+let flipX = null, flipY = null;
+async function toggleFlip(axis) {
+  let newX = flipX, newY = flipY;
+  if (axis === 'x') newX = !flipX;
+  if (axis === 'y') newY = !flipY;
+  const r = await fetch('/api/flip', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({flip_x: newX, flip_y: newY})
+  });
+  const j = await r.json();
+  flipX = j.flip_x; flipY = j.flip_y;
+  updateFlipUI();
+  document.getElementById('msg').textContent = `กลับภาพ: แกน X (ซ้าย-ขวา) = ${flipX ? 'เปิด' : 'ปิด'}, แกน Y (บน-ล่าง) = ${flipY ? 'เปิด' : 'ปิด'}`;
+}
+function updateFlipUI() {
+  const bx = document.getElementById('btnFlipX');
+  const by = document.getElementById('btnFlipY');
+  if (bx) {
+    bx.style.background = flipX ? '#2e7d32' : '#3a4250';
+    bx.textContent = (flipX ? '✓ ' : '') + '↔ กลับซ้าย-ขวา (แกน X)';
+  }
+  if (by) {
+    by.style.background = flipY ? '#2e7d32' : '#3a4250';
+    by.textContent = (flipY ? '✓ ' : '') + '↕ กลับบน-ล่าง (แกน Y)';
+  }
+}
+
 function spotName(idx, per) {
   if (per === 2) return idx === 1 ? 'ซ้าย' : 'ขวา';
   return 'ดวง ' + idx;
 }
 async function poll() {
   const j = await (await fetch('/api/status')).json();
+  if (j.flip_x !== undefined && j.flip_y !== undefined) {
+    if (flipX !== j.flip_x || flipY !== j.flip_y) {
+      flipX = j.flip_x; flipY = j.flip_y;
+      updateFlipUI();
+    }
+  }
   const el = document.getElementById('result');
   if (!j.running) {
     el.innerHTML = j.cam_error
@@ -797,8 +869,20 @@ def main():
     p.add_argument("--thresh", type=float, default=None,
                    help=f"เกณฑ์ NG b* (ไม่ใส่ = ใช้ค่าที่จำใน config.json หรือ {THRESH}); "
                         f"ใส่แล้วจำถาวร")
+    p.add_argument("--flip-x", action="store_true",
+                   help="กลับภาพแนวนอน (ซ้าย-ขวา) และจำถาวร")
+    p.add_argument("--flip-y", action="store_true",
+                   help="กลับภาพแนวตั้ง (บน-ล่าง) และจำถาวร")
     args = p.parse_args()
     cfg = load_config()
+    if args.flip_x:
+        SES.flip_x = True
+        cfg["flip_x"] = True
+        save_config(cfg)
+    if args.flip_y:
+        SES.flip_y = True
+        cfg["flip_y"] = True
+        save_config(cfg)
     # VID/PID ที่จะใช้ผูกกล้อง: --vidpid > ค่าใน config > ค่าเริ่มต้น (C200)
     CAMERA_VIDPID = args.vidpid or cfg.get("cam_vidpid") or C200_VID_PID
     if args.vidpid:

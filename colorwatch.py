@@ -170,6 +170,12 @@ def cmd_run(args):
             if not ok:
                 time.sleep(0.1)
                 continue
+            if args.flip_x and args.flip_y:
+                frame = cv2.flip(frame, -1)
+            elif args.flip_x:
+                frame = cv2.flip(frame, 1)
+            elif args.flip_y:
+                frame = cv2.flip(frame, 0)
             now = time.time()
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
@@ -311,6 +317,8 @@ def main():
     r.add_argument("--interval", type=float, default=1.0,
                    help="รายงานทุกกี่วินาที (default 1)")
     r.add_argument("--flip", action="store_true", help="สลับ label ซ้าย/ขวา")
+    r.add_argument("--flip-x", action="store_true", help="กลับภาพแนวนอน (ซ้าย-ขวา)")
+    r.add_argument("--flip-y", action="store_true", help="กลับภาพแนวตั้ง (บน-ล่าง)")
     r.add_argument("--json", action="store_true", help="output เป็น JSON lines")
     r.add_argument("--show", action="store_true", help="โชว์หน้าต่าง debug")
     r.set_defaults(func=cmd_run)
