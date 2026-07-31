@@ -1,0 +1,17 @@
+# virtualenv / deps
+.venv/
+node_modules/
+
+# python cache
+__pycache__/
+*.pyc
+
+# runtime/per-machine state (ตั้งค่าของแต่ละเครื่อง — ไม่ commit)
+config.json
+calibration.json
+
+# OS
+.DS_Store
+
+# camera snapshots / tuning images (รูปทดสอบ — ไม่ commit)
+*.png

@@ -1,0 +1,9 @@
+# ติดตั้ง:  pip install -r requirements.txt
+# (เวอร์ชันขั้นต่ำที่ทดสอบแล้ว — ใหม่กว่านี้ปกติใช้ได้)
+opencv-python>=4.8
+numpy>=1.24
+fastapi>=0.110
+uvicorn>=0.27
+pydantic>=2.0
+# Windows: เลือกกล้องด้วย VID/PID (ดึงรายชื่อกล้อง DirectShow ตามลำดับ index)
+pygrabber>=0.2; sys_platform == "win32"
