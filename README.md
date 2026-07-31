@@ -1,9 +1,16 @@
 # 🔍 ตรวจสีไฟ LED (LED colorwatch)
 
-โปรแกรมตรวจว่าไฟ LED ดวงไหน **"เพี้ยน (ออกฟ้า/เหลือง)"** ผ่านกล้อง — ดูผลบนหน้าเว็บ
-เขียว= ผ่าน / แดง = ไม่ผ่าน (NG) บอกชิ้น+ทิศที่เพี้ยน **ไม่ต้องพิมพ์คำสั่งตอนใช้งาน คลิกบนเว็บอย่างเดียว**
+[![Based On](https://img.shields.io/badge/Based%20On-pitchakorn--pkt%2Fled--colorwatch-181717?style=for-the-badge&logo=github&logoColor=white)](https://github.com/pitchakorn-pkt/led-colorwatch)
+[![Python](https://img.shields.io/badge/PYTHON-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
+[![FastAPI](https://img.shields.io/badge/FASTAPI-009688?style=for-the-badge&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
+[![OpenCV](https://img.shields.io/badge/OPENCV-5C3EE8?style=for-the-badge&logo=opencv&logoColor=white)](https://opencv.org/)
+[![NumPy](https://img.shields.io/badge/NUMPY-013243?style=for-the-badge&logo=numpy&logoColor=white)](https://numpy.org/)
 
+> 📌 **พัฒนาต่อยอดมาจาก:** [pitchakorn-pkt/led-colorwatch](https://github.com/pitchakorn-pkt/led-colorwatch)  
 > รองรับ **Windows / macOS / Linux** • ใช้กล้อง USB (เทสกับ Anker PowerConf C200)
+
+โปรแกรมตรวจว่าไฟ LED ดวงไหน **"เพี้ยน (ออกฟ้า/เหลือง)"** ผ่านกล้อง — ดูผลบนหน้าเว็บ  
+เขียว = ผ่าน / แดง = ไม่ผ่าน (NG) บอกชิ้น+ทิศที่เพี้ยน **ไม่ต้องพิมพ์คำสั่งตอนใช้งาน คลิกบนเว็บอย่างเดียว**
 
 ---
 
