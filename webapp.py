@@ -567,6 +567,11 @@ class DirectionReq(BaseModel):
     value: str
 
 
+class CalibrateReq(BaseModel):
+    # ติ๊กออก = ข้ามด่านตรวจว่าชิ้นที่วางสีใกล้กันไหม แล้ว calibrate เลย
+    check_spread: bool = True
+
+
 # ---------- endpoints ----------
 
 @app.post("/api/flip")
@@ -755,8 +760,11 @@ def api_start(req: StartReq):
 
 
 @app.post("/api/calibrate")
-def api_calibrate():
-    """วางชิ้นดีครบตามจำนวน → เรียกตอนกำลังตรวจ — ตั้งขาวอ้างอิงและจำถาวร"""
+def api_calibrate(req: Optional[CalibrateReq] = None):
+    """วางชิ้นดีครบตามจำนวน → เรียกตอนกำลังตรวจ — ตั้งขาวอ้างอิงและจำถาวร
+
+    body ว่างได้ (ของเดิมเรียกแบบไม่ส่ง body) → ตรวจความห่างตามปกติ"""
+    check_spread = True if req is None else req.check_spread
     with SES.lock:
         engine = SES.engine
         frame = SES.frame.copy() if SES.frame is not None else None
@@ -765,13 +773,14 @@ def api_calibrate():
                                       "(ต้องรู้จำนวนจุดก่อน)"}, status_code=400)
     if frame is None:
         return JSONResponse({"error": "ยังไม่มีภาพจากกล้อง"}, status_code=400)
-    ref, msg = engine.calibrate(frame)
+    ref, msg = engine.calibrate(frame, check_spread=check_spread)
     if ref is None:
         return JSONResponse({"error": msg}, status_code=400)
     with SES.lock:
         SES.reference = ref
     save_reference(ref)
-    return {"ok": True, "reference": round(ref, 2), "msg": msg}
+    return {"ok": True, "reference": round(ref, 2), "msg": msg,
+            "checked_spread": check_spread}
 
 
 @app.post("/api/calibrate/clear")
@@ -933,8 +942,15 @@ PAGE = """<!doctype html>
       <div style="margin-top:10px">
         <button onclick="calibrate()" style="background:#7b5dbe;color:#fff">🎯 Calibrate ขาว (วางชิ้นดีให้ครบก่อนกด)</button>
         <button onclick="clearCalib()">ล้างอ้างอิง</button>
+        <label style="margin-left:10px;cursor:pointer">
+          <input type="checkbox" id="calspread" checked style="vertical-align:middle">
+          ตรวจความห่างก่อน calibrate
+        </label>
         <span id="calinfo" class="hint"></span>
       </div>
+      <div class="hint">ติ๊กไว้ = ถ้าชิ้นที่วางสีต่างกันเกินเกณฑ์ จะไม่ยอม calibrate (กันเผลอมีชิ้นเสียปน)
+        — ติ๊กออกเมื่อรู้อยู่แล้วว่าดวงแต่ละตำแหน่งสีต่างกันเองตามธรรมชาติ
+        <span style="color:#ffb454">ระวัง: ติ๊กออกแล้วถ้ามีชิ้นเสียปนอยู่ ค่าอ้างอิงจะเพี้ยนโดยไม่มีใครเตือน</span></div>
       <div style="margin-top:10px">
         <span style="font-weight:600">🎯 จับการเพี้ยนทิศไหน:</span>
         <select id="dirsel" onchange="setDirection(this.value)"
@@ -1059,13 +1075,24 @@ async function stop() {
   document.getElementById('msg').textContent = '';
 }
 async function calibrate() {
-  const r = await fetch('/api/calibrate', {method:'POST'});
+  const chk = document.getElementById('calspread').checked;
+  const r = await fetch('/api/calibrate', {method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({check_spread: chk})});
   const j = await r.json();
-  document.getElementById('msg').textContent = j.ok ? '✓ ' + j.msg : '✗ ' + j.error;
+  // เขียนลง calinfo (ช่องข้างปุ่ม calibrate) ไม่ใช่ msg ที่ปุ่มอื่นใช้ร่วมกัน
+  // → ย้อมสีเตือนได้โดยไม่ไปติดค้างกับข้อความของปุ่มอื่น
+  const el = document.getElementById('calinfo');
+  el.textContent = j.ok ? '✓ ' + j.msg : '✗ ' + j.error;
+  el.style.color = !j.ok ? '#ff6b6b'
+                 : (j.checked_spread ? '#6fdc8c' : '#ffb454');
+  document.getElementById('msg').textContent = '';
 }
 async function clearCalib() {
   await fetch('/api/calibrate/clear', {method:'POST'});
-  document.getElementById('msg').textContent = 'ล้างอ้างอิงแล้ว — กลับโหมดเทียบกันเอง';
+  const el = document.getElementById('calinfo');
+  el.textContent = 'ล้างอ้างอิงแล้ว — กลับโหมดเทียบกันเอง';
+  el.style.color = '';
 }
 let expLevel = 5;            // ระดับแสงปัจจุบัน (น้อย = มืด) ตรงกับ DEFAULT_EXPOSURE ตอนเปิดกล้อง
 async function applyExp(v) {

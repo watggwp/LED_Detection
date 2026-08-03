@@ -152,9 +152,14 @@ class MultiWatch:
                 assigned[best] = blob
         return assigned
 
-    def calibrate(self, frame, now=None):
+    def calibrate(self, frame, now=None, check_spread=True):
         """วางชิ้นดีให้ครบ n จุดแล้วเรียก — ตั้ง reference = median b* ของชิ้นดีทั้งหมด
-        และยึดสล็อตจากเฟรมนี้ คืน (ref, msg) — ref เป็น None ถ้าวัดไม่ได้"""
+        และยึดสล็อตจากเฟรมนี้ คืน (ref, msg) — ref เป็น None ถ้าวัดไม่ได้
+
+        check_spread=False = ข้ามด่านตรวจว่าชิ้นที่วางสีใกล้กันไหม แล้ว calibrate เลย
+        ใช้เมื่อรู้อยู่แล้วว่าดวงแต่ละตำแหน่งสีต่างกันเองตามธรรมชาติ (เช่นใช้ LED ต่างล็อต
+        หรือมุมสะท้อนไม่เท่ากัน) ซึ่งด่านนี้จะปฏิเสธทั้งหมดทำให้ calibrate ไม่ได้เลย
+        แลกมาด้วยการเสียตัวกันพลาด — ผู้เรียกต้องมั่นใจว่าไม่มีชิ้นเสียปนอยู่จริง"""
         now = time.time() if now is None else now
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         rois = find_spots(gray, self.n, self.detect_rel)
@@ -167,16 +172,23 @@ class MultiWatch:
         # (เคยเกิดจริง 2026-06-12: calibrate ทั้งที่มีชิ้นฟ้าอยู่ → ref กลายเป็นค่ากลาง
         #  ระหว่างดี-เสีย แล้วทุกชิ้นผ่านหมด)
         spread = max(bs) - min(bs)
-        if spread > self.thresh:
+        if check_spread and spread > self.thresh:
             return None, (f"สีชิ้นที่วางต่างกันเกินไป (ห่างสุด {spread:.1f} เกินเกณฑ์ "
                           f"{self.thresh:.0f}) — น่าจะมีชิ้นเพี้ยนปนอยู่ "
-                          f"เอาออกให้เหลือชิ้นดีล้วนๆ แล้ว calibrate ใหม่")
+                          f"เอาออกให้เหลือชิ้นดีล้วนๆ แล้ว calibrate ใหม่ "
+                          f"(ถ้าดวงแต่ละตำแหน่งสีต่างกันเองจริง ให้ติ๊กออกช่อง "
+                          f"'ตรวจความห่างก่อน calibrate' แล้วกดอีกครั้ง)")
         self.reference = float(statistics.median(bs))
         self._lock_slots(rois)
         self._reset_history()
         for t in self.timers:
             t.since = None
-        return self.reference, f"อ้างอิงขาว b* = {self.reference:+.2f} (จาก {self.n} จุด)"
+        msg = f"อ้างอิงขาว b* = {self.reference:+.2f} (จาก {self.n} จุด)"
+        # บอก spread ที่ยอมรับไปด้วยเสมอตอนข้ามด่าน — ผู้ใช้ต้องเห็นว่ารับอะไรเข้ามา
+        if not check_spread:
+            msg += (f" — ข้ามการตรวจความห่าง (ชิ้นที่วางห่างกันสุด {spread:.1f}"
+                    f"{' ซึ่งเกินเกณฑ์ ' + format(self.thresh, '.0f') if spread > self.thresh else ''})")
+        return self.reference, msg
 
     def resolved_direction(self):
         """ทิศทางที่ใช้ตัดสินจริงในเฟรมถัดไป (แปลง None ให้แล้ว)"""
