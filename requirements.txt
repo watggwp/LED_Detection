@@ -6,4 +6,7 @@ fastapi>=0.110
 uvicorn>=0.27
 pydantic>=2.0
 # Windows: เลือกกล้องด้วย VID/PID (ดึงรายชื่อกล้อง DirectShow ตามลำดับ index)
+# ใช้แค่ pygrabber.dshow_core / dshow_ids (นิยาม COM interface) ไม่ใช่ pygrabber.dshow_graph
+# เพราะโมดูลนั้นต้องการ Python >= 3.9 — ดู colorwatch.win_camera_names()
 pygrabber>=0.2; sys_platform == "win32"
+comtypes; sys_platform == "win32"

@@ -31,6 +31,10 @@ import numpy as np
 SAT_LIMIT = 250      # pixel ที่ channel ใดแตะค่านี้ = อิ่มตัว (ขาวโพลน) วัดสีไม่ได้
 MIN_BLOB_AREA = 200  # ขนาด blob ขั้นต่ำ (px) กันจับฝุ่น/แสงสะท้อนเล็กๆ
 
+# Windows: ใช้ DirectShow แทน MSMF (backend เริ่มต้น) — MSMF เปิดกล้อง + set ความละเอียด
+# กิน ~11s ต่อครั้ง ส่วน DSHOW ~1.8s (วัดจริง ดูคอมเมนต์ใน webapp.py)
+CAP_BACKEND = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY
+
 
 def find_two_spots(gray):
     """หา blob สว่างสุด 2 อัน คืน [(x,y,w,h), ...] เรียงซ้าย→ขวา หรือ None"""
@@ -145,8 +149,63 @@ class HoldTimer:
         return (now - self.since) >= self.hold
 
 
+_NAMES_CACHE = {"t": 0.0, "names": None}
+_NAMES_TTL = 5.0     # สั้นพอให้เสียบกล้องใหม่แล้วเห็นภายในไม่กี่วินาที
+
+
+def win_camera_names(force=False):
+    """ชื่อกล้องเรียงตาม index ของ OpenCV/DirectShow บน Windows — [] ถ้าใช้ไม่ได้
+
+    ไม่ import pygrabber.dshow_graph (ทางที่ requirements.txt ตั้งใจไว้) เพราะโมดูลนั้นมีบรรทัด
+    `Mat = np.ndarray[int, np.dtype[np.generic]]` ซึ่งต้องใช้ Python >= 3.9 → บน venv 3.8
+    ของโปรเจกต์นี้ import พังทั้งก้อนด้วย TypeError แล้วถูก except กลืนหายไปเงียบๆ
+    ที่นี่จึงเรียก DirectShow SystemDeviceEnum ผ่าน comtypes ตรงๆ (โค้ดชุดเดียวกับที่ pygrabber
+    ใช้ภายใน แต่ไม่ติดข้อจำกัดเวอร์ชัน) — วัดได้ ~0.3s ต่อครั้ง
+    """
+    if sys.platform != "win32":
+        return []
+    now = time.time()
+    if (not force and _NAMES_CACHE["names"] is not None
+            and now - _NAMES_CACHE["t"] < _NAMES_TTL):
+        return _NAMES_CACHE["names"]
+    names = []
+    try:
+        import comtypes
+        from comtypes import GUID, client
+        from comtypes.persist import IPropertyBag
+        from pygrabber.dshow_core import ICreateDevEnum
+        from pygrabber.dshow_ids import DeviceCategories, clsids
+        comtypes.CoInitialize()
+        try:
+            sde = client.CreateObject(clsids.CLSID_SystemDeviceEnum,
+                                      interface=ICreateDevEnum)
+            en = sde.CreateClassEnumerator(
+                GUID(DeviceCategories.VideoInputDevice), dwFlags=0)
+            try:
+                moniker, count = en.Next(1)
+            except ValueError:      # ไม่มีกล้องเลย — enumerator คืนค่าว่างแบบนี้
+                moniker, count = None, 0
+            while count > 0:
+                bag = moniker.BindToStorage(
+                    0, 0, IPropertyBag._iid_).QueryInterface(IPropertyBag)
+                names.append(bag.Read("FriendlyName", pErrorLog=None))
+                moniker, count = en.Next(1)
+        finally:
+            try:
+                comtypes.CoUninitialize()
+            except Exception:
+                pass
+    except Exception as e:
+        # ไม่ให้พังเงียบอีก — ระบบยังเดินต่อได้ด้วยการไล่ index ธรรมดา แค่ช้ากว่า
+        print(f"[camera] อ่านรายชื่อกล้อง DirectShow ไม่ได้ "
+              f"({type(e).__name__}: {e}) — จะไล่สแกน index แทน", file=sys.stderr)
+        names = []
+    _NAMES_CACHE["t"], _NAMES_CACHE["names"] = now, names
+    return names
+
+
 def open_camera(index):
-    cap = cv2.VideoCapture(index)
+    cap = cv2.VideoCapture(index, CAP_BACKEND)
     if not cap.isOpened():
         sys.exit(f"เปิดกล้อง index {index} ไม่ได้ — ลอง --cam 1 หรือ 2")
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
@@ -293,13 +352,17 @@ def draw_debug(frame, rois, bl, br, diff, L, R, flipped):
 
 
 def cmd_list(args):
-    """ไล่เช็คว่ามีกล้อง index ไหนเปิดได้บ้าง"""
-    for i in range(6):
-        cap = cv2.VideoCapture(i)
+    """ไล่เช็คว่ามีกล้อง index ไหนเปิดได้บ้าง (พร้อมชื่อรุ่นถ้าถามจาก Windows ได้)"""
+    names = win_camera_names()
+    for i in range(len(names) if names else 6):
+        cap = cv2.VideoCapture(i, CAP_BACKEND)
         ok = cap.isOpened() and cap.read()[0]
         cap.release()
+        who = f" — {names[i]}" if i < len(names) else ""
         if ok:
-            print(f"camera index {i}: ใช้ได้")
+            print(f"camera index {i}: ใช้ได้{who}")
+        elif who:
+            print(f"camera index {i}: เปิดไม่ได้ (ถูกใช้อยู่/สายหลุด){who}")
 
 
 def main():

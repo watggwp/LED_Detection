@@ -125,7 +125,9 @@ D10 หลายกล้องจริง/index สลับ, D11 จับเ
 - **auto-lock:** `--exposure` default = 5 (เปิดมาเห็นแต่ดวงไฟบนพื้นดำเลย), `--exposure 0` = ปล่อย auto
 
 ### D10 — camera picker เห็นภาพ (`webapp.py`)
-- `GET /api/cameras` หยุด capture ชั่วคราว → ไล่เปิด OpenCV index 0–5 อ่าน 1 เฟรม ส่ง thumbnail base64 → เปิดกล้องคืน
+- `GET /api/cameras` ถามรายชื่อกล้องจาก DirectShow (รู้ว่ามีกี่ตัว/ชื่ออะไร) → กล้องที่กำลังใช้อยู่
+  ยืมเฟรมสดมาทำ thumbnail (ไม่ปิดกล้อง ภาพสดไม่ดับ) ส่วน index ที่เหลือ probe ขนานกัน →
+  ส่ง thumbnail base64 + ชื่อรุ่น + รายการกล้องที่เปิดไม่ได้ (`busy`) ทั้งก้อนถือ `CAM_CTL` กันชนกับ `/stream`
 - `POST /api/select_camera` ตั้ง `CAM_INDEX` + จำลง `config.json` + รีสตาร์ท capture
 - UI: ปุ่ม "📷 เลือกกล้อง" โชว์ภาพเล็ก คลิกเลือก (ไม่ต้องรู้ index) + รีโหลด stream
 - `--cam` default = None → ใช้ค่าที่จำใน `config.json` (ครั้งหน้าใช้กล้องเดิม)

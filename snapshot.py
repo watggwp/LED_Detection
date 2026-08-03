@@ -12,11 +12,11 @@ import sys
 
 import cv2
 
-from colorwatch import find_two_spots, grow, measure_bstar
+from colorwatch import CAP_BACKEND, find_two_spots, grow, measure_bstar
 
 
 def snap(index, warmup):
-    cap = cv2.VideoCapture(index)
+    cap = cv2.VideoCapture(index, CAP_BACKEND)
     if not cap.isOpened():
         print(f"cam {index}: เปิดไม่ได้", file=sys.stderr)
         return

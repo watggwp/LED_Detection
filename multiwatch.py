@@ -31,6 +31,27 @@ from colorwatch import (MIN_BLOB_AREA, HoldTimer, estimate_cct,
 
 MAX_SPOTS = 10  # จำกัดต่อรอบ — แถวแนวนอนบนเฟรม 1280px เกินนี้แต่ละจุดเล็กจนวัดไม่นิ่ง
 
+# ทิศทางการเบี่ยงสีที่ถือว่า NG (b* ติดลบ = ฟ้า, บวก = เหลือง)
+#   both   = เบี่ยงทางไหนก็ NG
+#   blue   = NG เฉพาะที่ฟ้าเกิน (เหลืองปล่อยผ่าน) — ใช้เมื่ออาการเสียของงานมีทางเดียว
+#   yellow = NG เฉพาะที่เหลืองเกิน
+DIR_BOTH, DIR_BLUE, DIR_YELLOW = "both", "blue", "yellow"
+DIRECTIONS = (DIR_BOTH, DIR_BLUE, DIR_YELLOW)
+
+
+def resolve_direction(direction, reference):
+    """แปลง direction=None เป็นพฤติกรรมเดิมของโปรแกรม (ก่อนมีตัวเลือกนี้)
+
+      มี reference (calibrate แล้ว) → จับสองทาง (ฟ้า+เหลือง)
+      ไม่มี reference (เทียบกันเอง) → จับฟ้าทางเดียว
+
+    คง default นี้ไว้เพื่อไม่ให้ผู้เรียกเดิม (เช่น CLI ของไฟล์นี้ ที่ไม่ส่ง reference
+    และไม่ส่ง direction) เปลี่ยนพฤติกรรม — ผู้ที่อยากคุมเองส่ง direction มา แล้วค่านั้นชนะ
+    กติกานี้เขียนที่นี่ที่เดียว ทั้ง engine และ webapp เรียกใช้ร่วมกัน"""
+    if direction is not None:
+        return direction
+    return DIR_BOTH if reference is not None else DIR_BLUE
+
 # เกณฑ์ detection แบบ relative (สัดส่วนของ gray.max())
 # 0.6 (ผ่อนกว่า 0.85 เดิม) ใช้ได้ปลอดภัยเมื่อ "ล็อกแสงต่ำ → พื้นหลังดำ" (ดู A3 ใน webapp)
 # พื้นดำทำให้ดวงที่หรี่กว่ายังโผล่เป็น blob โดยไม่มีแสงห้องมารวมแผงเป็นก้อนเดียว
@@ -79,11 +100,16 @@ class MultiWatch:
     """engine ตรวจ N จุด — ป้อนเฟรมผ่าน update() ได้สถานะกลับ ไม่ผูกกับกล้อง/UI"""
 
     def __init__(self, n_spots, thresh=4.0, hold=5.0, smooth=15, reference=None,
-                 detect_rel=DETECT_REL):
+                 detect_rel=DETECT_REL, direction=None):
         if not 2 <= n_spots <= MAX_SPOTS:
             raise ValueError(f"n_spots ต้องอยู่ระหว่าง 2 ถึง {MAX_SPOTS}")
+        if direction is not None and direction not in DIRECTIONS:
+            raise ValueError(f"direction ต้องเป็นหนึ่งใน {sorted(DIRECTIONS)}")
         self.n = n_spots
         self.thresh = thresh
+        # ทิศทางที่ถือว่า NG — เปลี่ยนสดได้ (อ่านใหม่ทุกเฟรมใน update())
+        # None = ตามพฤติกรรมเดิมของโปรแกรม ดู resolved_direction()
+        self.direction = direction
         self.smooth = smooth
         self.detect_rel = detect_rel
         # สล็อต = ตำแหน่งช่องที่ยึดไว้หลังเจอครบ N ครั้งแรก/ตอน calibrate (len==n, ซ้าย→ขวา)
@@ -152,6 +178,23 @@ class MultiWatch:
             t.since = None
         return self.reference, f"อ้างอิงขาว b* = {self.reference:+.2f} (จาก {self.n} จุด)"
 
+    def resolved_direction(self):
+        """ทิศทางที่ใช้ตัดสินจริงในเฟรมถัดไป (แปลง None ให้แล้ว)"""
+        return resolve_direction(self.direction, self.reference)
+
+    def _is_bad(self, sdev):
+        """เบี่ยงเท่านี้ถือว่า NG ไหม — ตัดสินจาก thresh + ทิศทางที่ใช้จริง
+
+        NB: เทียบกันเอง + จับสองทาง ตอน n=2 ใช้ไม่ได้ผล เพราะ dev ของสองดวงเป็นภาพ
+        สะท้อนกัน (b_ซ้าย−b_ขวา กับ b_ขวา−b_ซ้าย) → เกินเกณฑ์พร้อมกันทั้งคู่เสมอ
+        แยกไม่ออกว่าดวงไหนผิด ฝั่ง webapp จึงเตือนไม่ให้ใช้คู่นี้"""
+        d = self.resolved_direction()
+        if d == DIR_BLUE:
+            return sdev < -self.thresh
+        if d == DIR_YELLOW:
+            return sdev > self.thresh
+        return abs(sdev) > self.thresh
+
     def _reset_history(self):
         """ล้างเฉพาะ rolling window — hold timer ต้องเดินต่อ ไม่งั้น re-detect
         จะทำสถานะ BAD หลุดเป็น OK เป็นจังหวะ"""
@@ -210,10 +253,7 @@ class MultiWatch:
             if len(hist) > self.smooth:
                 hist.pop(0)
             sdev = float(np.mean(hist))
-            if self.reference is not None:
-                cond = abs(sdev) > self.thresh
-            else:
-                cond = sdev < -self.thresh
+            cond = self._is_bad(sdev)
             bad = self.timers[i].update(cond, now)
             spot = {"i": i + 1, "b": round(b, 2), "dev": round(sdev, 2),
                     "state": "BAD" if bad else "OK"}
