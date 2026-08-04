@@ -39,8 +39,8 @@ from colorwatch import win_camera_names as _win_camera_names
 from multiwatch import (DIRECTIONS, MAX_SPOTS, MultiWatch, resolve_direction)
 
 app = FastAPI(title="LED colorwatch")
-CAM_INDEX = 0
 IDLE_RELEASE_SEC = 60.0   # ไม่มีคนดู stream + ไม่ได้ตรวจ เกินนี้ → ปล่อยกล้อง (ประหยัดแบต)
+MAX_CAMS = 2              # จำนวนกล้องสูงสุดที่รองรับ (แผงชุดที่ 1 / ชุดที่ 2)
 
 # Windows: บังคับใช้ DirectShow แทน MSMF (backend เริ่มต้นของ OpenCV บน Windows ซึ่งช้ามาก)
 # วัดบนเครื่องทดสอบ (OpenCV 5.0.0, Python 3.8-32):
@@ -75,30 +75,76 @@ CALIB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 def load_config():
     try:
         with open(CONFIG_FILE) as f:
-            return json.load(f)
+            cfg = json.load(f)
+        return cfg if isinstance(cfg, dict) else {}
     except Exception:
         return {}
 
 
-def save_config(cfg):
+def _write_json(path, data):
+    """เขียนแบบ atomic — เขียนไฟล์ชั่วคราวก่อนแล้วค่อย replace ทับ
+    กันเคสอีกโปรเซสอ่านไปเจอไฟล์ที่เขียนค้างครึ่งทางแล้ว parse ไม่ผ่าน"""
+    tmp = path + ".tmp"
     try:
-        with open(CONFIG_FILE, "w") as f:
-            json.dump(cfg, f)
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, path)
+        return True
     except OSError:
-        pass
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return False
 
 
-def load_reference():
+def update_config(**changes):
+    """อ่าน-แก้-เขียน config อย่างปลอดภัย
+
+    ถ้าไฟล์มีอยู่แต่อ่านไม่สำเร็จ จะ "ไม่เขียนทับ" เพราะไม่รู้ค่าเดิม — กันเคสที่เคยเกิดจริง:
+    load_config() คืน {} เพราะอ่านชนกับการเขียนของอีกโปรเซส แล้ว save ทับจนค่าที่ตั้งไว้
+    (กล้อง/flip/thresh/direction) หายเกลี้ยง เหลือแค่คีย์ที่เพิ่งตั้ง"""
+    cfg = {}
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE) as f:
+                cfg = json.load(f)
+            if not isinstance(cfg, dict):
+                cfg = {}
+        except Exception as e:
+            print(f"[config] อ่าน {CONFIG_FILE} ไม่ได้ ({e}) — "
+                  f"ไม่เขียนทับเพื่อกันค่าที่ตั้งไว้หาย", file=sys.stderr)
+            return False
+    cfg.update(changes)
+    return _write_json(CONFIG_FILE, cfg)
+
+
+def save_config(cfg):
+    _write_json(CONFIG_FILE, cfg)
+
+
+def load_references():
+    """b* ขาวอ้างอิงของแต่ละกล้อง — list ยาว MAX_CAMS (None = ยังไม่ calibrate)
+
+    ต้องแยกต่อกล้อง ไม่ใช่ค่าเดียวร่วมกัน: กล้องคนละตัวให้ค่า b* ไม่เท่ากันแม้ส่องดวงเดียวกัน
+    (วัดแล้วแค่เปลี่ยน backend ของกล้องตัวเดิม ค่ายังเลื่อน ~0.7 หน่วย คนละรุ่นจะห่างกว่านั้นมาก)
+    รองรับไฟล์รูปแบบเก่า {"reference": x} → ยกให้เป็นของกล้องที่ 1"""
+    refs = [None] * MAX_CAMS
     try:
         with open(CALIB_FILE) as f:
-            return json.load(f).get("reference")
+            data = json.load(f)
     except Exception:
-        return None
+        return refs
+    if isinstance(data.get("references"), list):
+        for i, v in enumerate(data["references"][:MAX_CAMS]):
+            refs[i] = v
+    elif data.get("reference") is not None:      # ไฟล์เก่าก่อนรองรับ 2 กล้อง
+        refs[0] = data["reference"]
+    return refs
 
 
-def save_reference(ref):
-    with open(CALIB_FILE, "w") as f:
-        json.dump({"reference": ref}, f)
+def save_references(refs):
+    _write_json(CALIB_FILE, {"references": list(refs)})
 
 
 # ---------- ล็อกแสง (A3: แยกชั้นตามแพลตฟอร์ม) ----------
@@ -343,27 +389,30 @@ def _thumb(frame, width=220):
 
 
 class Session:
-    """สถานะกล้อง+การตรวจ — กล้องเปิดเมื่อมีคนดู/ตรวจ, ปล่อยเองตอน idle (D11)"""
+    """สถานะของ "หนึ่งกล้อง" — กล้อง + engine ตรวจของตัวเอง
+    กล้องเปิดเมื่อมีคนดู/ตรวจ, ปล่อยเองตอน idle (D11)
 
-    def __init__(self):
-        cfg = load_config()
+    slot = ลำดับกล้อง (0 = แผงชุดแรก, 1 = แผงชุดที่สอง) ใช้เป็น key ของค่าที่จำไว้
+    ทุกอย่างที่ผูกกับตัวกล้อง (index, flip, ค่าอ้างอิง) อยู่ในนี้ ไม่ใช่ global
+    ส่วนที่เป็นนโยบายร่วม (thresh, direction, จำนวนแผง) ยังเป็น global ใช้ร่วมกัน"""
+
+    def __init__(self, slot, cam_index=0, flip_x=False, flip_y=False,
+                 reference=None):
+        self.slot = slot
+        self.cam_index = cam_index
         self.lock = threading.Lock()
         self.thread = None
         self.stop_flag = False
         self.cap = None        # cap ปัจจุบัน (ให้ A3 OpenCV ตั้ง property ได้ ใน thread นี้)
         self.engine = None     # None = โหมดพรีวิว (โชว์ภาพเฉยๆ ไม่ตรวจ)
-        # จำนวนแผง × ดวงต่อแผง ที่ใช้ล่าสุด — จำไว้ข้าม session จะได้ไม่ต้องกรอกใหม่ทุกครั้ง
-        # (หน้างานตั้งค่าเดิมซ้ำๆ ทุกวัน) ค่าเริ่มต้นเท่ากับที่ฟอร์มเคยตั้งไว้
-        self.pieces = int(cfg.get("pieces", 1))
-        self.per_piece = int(cfg.get("per_piece", 2))
         self.jpeg = None       # เฟรมล่าสุด (bytes)
         self.status = None     # สถานะล่าสุด (dict, มี cct)
         self.frame = None      # เฟรมดิบล่าสุด (ก่อน annotate) — ใช้ตอน calibrate
-        self.reference = load_reference()  # b* ขาวอ้างอิง (คงไว้ข้าม start/stop)
+        self.reference = reference   # b* ขาวอ้างอิงของกล้องนี้ (คงไว้ข้าม start/stop)
         self.last_stream = time.time()     # เวลาเฟรมล่าสุดที่ stream ถูกดึง (D11)
         self.cam_error = None
-        self.flip_x = cfg.get("flip_x", False)  # กลับภาพแนวนอน (ซ้าย-ขวา)
-        self.flip_y = cfg.get("flip_y", False)  # กลับภาพแนวตั้ง (บน-ล่าง)
+        self.flip_x = flip_x   # กลับภาพแนวนอน (ซ้าย-ขวา)
+        self.flip_y = flip_y   # กลับภาพแนวตั้ง (บน-ล่าง)
         # คิวคำสั่งตั้ง exposure ฝั่ง OpenCV (ต้องทำใน capture thread ที่ถือ cap)
         self.exp_pending = False
         self.exp_value = None
@@ -374,8 +423,52 @@ class Session:
         return self.engine is not None
 
 
-SES = Session()
+def _load_sessions():
+    """สร้าง Session ตามที่จำไว้ใน config
+
+    รูปแบบใหม่: "cams": [{"index":1,"flip_x":true,...}, {...}]
+    รูปแบบเก่า (กล้องเดียว): "cam_index"/"flip_x"/"flip_y" ที่ระดับบนสุด — แปลงให้อัตโนมัติ
+    เพื่อให้เครื่องที่อัปเดตมาแล้วยังใช้ค่าเดิมได้ทันทีโดยไม่ต้องตั้งใหม่"""
+    cfg = load_config()
+    refs = load_references()
+    cams = cfg.get("cams")
+    if not isinstance(cams, list) or not cams:
+        cams = [{"index": int(cfg.get("cam_index", 0)),
+                 "flip_x": bool(cfg.get("flip_x", False)),
+                 "flip_y": bool(cfg.get("flip_y", False))}]
+    out = []
+    for slot, c in enumerate(cams[:MAX_CAMS]):
+        out.append(Session(slot,
+                           cam_index=int(c.get("index", 0)),
+                           flip_x=bool(c.get("flip_x", False)),
+                           flip_y=bool(c.get("flip_y", False)),
+                           reference=refs[slot] if slot < len(refs) else None))
+    return out
+
+
+def save_sessions_config():
+    """เขียนรายการกล้อง (index + flip ของแต่ละตัว) ลง config"""
+    update_config(
+        cams=[{"index": s.cam_index, "flip_x": s.flip_x, "flip_y": s.flip_y}
+              for s in SESSIONS],
+        # ค่าเก่าระดับบนสุด: คงไว้ให้ตรงกับกล้องตัวแรก เผื่อ downgrade กลับเวอร์ชันเดิม
+        cam_index=SESSIONS[0].cam_index,
+        flip_x=SESSIONS[0].flip_x, flip_y=SESSIONS[0].flip_y)
+
+
+SESSIONS = _load_sessions()
+_cfg0 = load_config()
+# จำนวนแผง × ดวงต่อแผง "ต่อกล้องหนึ่งตัว" — ใช้ร่วมกันทุกกล้อง
+# กล้องที่ 1 ได้แผง 1..PIECES, กล้องที่ 2 ได้แผง PIECES+1..PIECES*2
+PIECES = int(_cfg0.get("pieces", 1))
+PER_PIECE = int(_cfg0.get("per_piece", 2))
+del _cfg0
 EXPOSURE_INIT = DEFAULT_EXPOSURE   # ตั้งจาก --exposure: ล็อกแสงทันทีที่กล้องเปิด
+
+
+def get_ses(cam):
+    """Session ของกล้องลำดับ cam — None ถ้าไม่มีกล้องนั้น"""
+    return SESSIONS[cam] if 0 <= cam < len(SESSIONS) else None
 
 # กันเปิด/ปิดกล้องชนกัน — ทุกจุดที่ "เปิด/ปิด/ไล่สแกน" กล้องต้องถือล็อกนี้
 # ไม่งั้นสองเธรดแตะ DirectShow device ตัวเดียวกันพร้อมกันได้ เช่น /api/cameras กำลัง probe
@@ -387,17 +480,20 @@ JOIN_TIMEOUT = 8.0     # เผื่อ VideoCapture() ที่ค้างอ
 
 
 def capture_loop(ses):
-    """thread ถือกล้อง — สลับพรีวิว/ตรวจตาม ses.engine, ปล่อยกล้องเองเมื่อ idle"""
-    global CAM_INDEX
+    """thread ถือกล้อง "หนึ่งตัว" — สลับพรีวิว/ตรวจตาม ses.engine, ปล่อยกล้องเองเมื่อ idle
+    แต่ละกล้องมี thread ของตัวเอง ตัวหนึ่งพังไม่ลามไปอีกตัว"""
     stopping = lambda: ses.stop_flag        # noqa: E731 — สั้นกว่าและใช้ที่เดียว
-    cap = open_cap(CAM_INDEX, stopping)
-    if cap is None and not ses.stop_flag:
+    cap = open_cap(ses.cam_index, stopping)
+    if cap is None and not ses.stop_flag and ses.slot == 0:
         # index ที่จำไว้เปิดไม่ได้ (อาจสลับพอร์ต) — ลองหาใหม่จาก VID/PID (Windows)
+        # ทำเฉพาะกล้องตัวแรก เพราะ VID/PID ผูกกับรุ่นเดียว ถ้ามีสองตัวรุ่นเดียวกันจะแยกไม่ออก
+        # แล้วจะไปแย่ง index ของอีกตัวมาใช้
+        taken = {s.cam_index for s in SESSIONS if s is not ses}
         alt = find_index_by_vidpid(CAMERA_VIDPID)
-        if alt is not None and alt != CAM_INDEX:
+        if alt is not None and alt != ses.cam_index and alt not in taken:
             cap = open_cap(alt, stopping)
             if cap is not None:
-                CAM_INDEX = alt
+                ses.cam_index = alt
     # โดนสั่งหยุดระหว่างเปิด — ปล่อยทิ้งเงียบๆ อย่าไปเขียน cam_error ทับสถานะของกล้องตัวใหม่
     if cap is not None and ses.stop_flag:
         try:
@@ -409,9 +505,10 @@ def capture_loop(ses):
         return
     if cap is None:
         names = _win_camera_names()
-        who = (f" ({names[CAM_INDEX]})" if 0 <= CAM_INDEX < len(names) else "")
+        idx = ses.cam_index
+        who = (f" ({names[idx]})" if 0 <= idx < len(names) else "")
         with ses.lock:
-            ses.cam_error = (f"เปิดกล้อง index {CAM_INDEX}{who} ไม่ได้ — "
+            ses.cam_error = (f"เปิดกล้อง index {idx}{who} ไม่ได้ — "
                              f"อาจถูกโปรแกรมอื่นใช้อยู่ (Teams/Zoom/OBS) หรือถอดสายไปแล้ว "
                              f"กด 'เลือกกล้อง' แล้วคลิกตัวที่เห็นไฟ LED")
             ses.jpeg = None
@@ -480,52 +577,57 @@ def capture_loop(ses):
                 ses.cap = None
 
 
-def ensure_camera():
+def ensure_camera(ses):
     with CAM_CTL:
-        with SES.lock:
-            t = SES.thread
+        with ses.lock:
+            t = ses.thread
             # thread ที่ยังไม่ตั้ง stop_flag = ตัวที่ใช้งานอยู่จริง → ไม่ต้องทำอะไร
-            if t is not None and t.is_alive() and not SES.stop_flag:
+            if t is not None and t.is_alive() and not ses.stop_flag:
                 return
         # ถ้าตัวเก่ากำลังปิดตัวอยู่ ต้องรอให้มันปล่อยกล้องก่อน ไม่งั้นตัวใหม่จะเปิดซ้ำ index เดิมไม่ได้
         if t is not None and t.is_alive():
             t.join(timeout=JOIN_TIMEOUT)
-        with SES.lock:
-            SES.stop_flag = False
-            SES.last_stream = time.time()
-            SES.thread = threading.Thread(target=capture_loop, args=(SES,),
+        with ses.lock:
+            ses.stop_flag = False
+            ses.last_stream = time.time()
+            ses.thread = threading.Thread(target=capture_loop, args=(ses,),
                                           daemon=True)
-            SES.thread.start()
+            ses.thread.start()
 
 
-def wait_first_frame(timeout=8.0):
+def ensure_all_cameras():
+    for s in SESSIONS:
+        ensure_camera(s)
+
+
+def wait_first_frame(ses, timeout=8.0):
     """รอจนกล้องส่งเฟรมแรก (หรือแจ้ง error) — คืน True ถ้ามีภาพแล้ว
     ใช้ตอนสลับกล้อง เพื่อให้ตอบกลับหน้าเว็บหลังภาพพร้อมจริง ไม่ใช่ปล่อยให้ <img> ค้างขาว"""
     deadline = time.time() + timeout
     while time.time() < deadline:
-        with SES.lock:
-            if SES.jpeg is not None:
+        with ses.lock:
+            if ses.jpeg is not None:
                 return True
-            if SES.cam_error is not None:
+            if ses.cam_error is not None:
                 return False
-            alive = SES.thread is not None and SES.thread.is_alive()
+            alive = ses.thread is not None and ses.thread.is_alive()
         if not alive:
             return False
         time.sleep(0.05)
     return False
 
 
-def stop_camera():
+def stop_camera(ses):
     """หยุด capture thread + ปล่อยกล้อง (รอ join จนกว่าจะดับจริง) — ใช้ก่อนสแกน/เปลี่ยนกล้อง"""
     with CAM_CTL:
-        with SES.lock:
-            t = SES.thread
-            cap = SES.cap
-            SES.stop_flag = True
+        with ses.lock:
+            t = ses.thread
+            cap = ses.cap
+            ses.stop_flag = True
 
         if t is None or not t.is_alive():
-            with SES.lock:
-                SES.thread = None
+            with ses.lock:
+                ses.thread = None
             return
 
         # ปล่อย cap ทันทีเพื่อปลดล็อก cap.read() ที่ค้างอยู่ใน OpenCV thread
@@ -536,9 +638,14 @@ def stop_camera():
                 pass
 
         t.join(timeout=JOIN_TIMEOUT)
-        with SES.lock:
+        with ses.lock:
             if not t.is_alive():
-                SES.thread = None
+                ses.thread = None
+
+
+def stop_all_cameras():
+    for s in SESSIONS:
+        stop_camera(s)
 
 
 # ---------- โมเดล request ----------
@@ -550,15 +657,22 @@ class StartReq(BaseModel):
 
 class ExposureReq(BaseModel):
     value: Optional[int] = None  # None = auto
+    cam: int = 0                 # กล้องลำดับไหน (0 = ตัวแรก)
 
 
 class CamReq(BaseModel):
     index: int
+    cam: int = 0
 
 
 class FlipReq(BaseModel):
     flip_x: Optional[bool] = None
     flip_y: Optional[bool] = None
+    cam: int = 0
+
+
+class CamCountReq(BaseModel):
+    count: int                   # จำนวนกล้องที่ใช้ (1 หรือ 2)
 
 
 class ThreshReq(BaseModel):
@@ -572,23 +686,28 @@ class DirectionReq(BaseModel):
 class CalibrateReq(BaseModel):
     # ติ๊กออก = ข้ามด่านตรวจว่าชิ้นที่วางสีใกล้กันไหม แล้ว calibrate เลย
     check_spread: bool = True
+    cam: int = 0
 
 
 # ---------- endpoints ----------
 
+def _bad_cam(cam):
+    return JSONResponse({"error": f"ไม่มีกล้องลำดับที่ {cam + 1}"}, status_code=400)
+
+
 @app.post("/api/flip")
 def api_flip(req: FlipReq):
-    with SES.lock:
+    ses = get_ses(req.cam)
+    if ses is None:
+        return _bad_cam(req.cam)
+    with ses.lock:
         if req.flip_x is not None:
-            SES.flip_x = req.flip_x
+            ses.flip_x = req.flip_x
         if req.flip_y is not None:
-            SES.flip_y = req.flip_y
-        cfg = load_config()
-        cfg["flip_x"] = SES.flip_x
-        cfg["flip_y"] = SES.flip_y
-        save_config(cfg)
-        fx, fy = SES.flip_x, SES.flip_y
-    return {"ok": True, "flip_x": fx, "flip_y": fy}
+            ses.flip_y = req.flip_y
+        fx, fy = ses.flip_x, ses.flip_y
+    save_sessions_config()
+    return {"ok": True, "flip_x": fx, "flip_y": fy, "cam": req.cam}
 
 def effective_direction(reference=None):
     """ทิศทางที่จะใช้ตัดสิน — ไว้โชว์ในหน้าเว็บตอนยังไม่ได้เริ่มตรวจ (ยังไม่มี engine)"""
@@ -607,12 +726,11 @@ def api_direction(req: DirectionReq):
             {"error": f"ทิศทางต้องเป็นหนึ่งใน {', '.join(DIRECTIONS)}"},
             status_code=400)
     DIRECTION = req.value
-    cfg = load_config()
-    cfg["direction"] = DIRECTION
-    save_config(cfg)
-    with SES.lock:
-        if SES.engine is not None:
-            SES.engine.direction = DIRECTION
+    update_config(direction=DIRECTION)
+    for s in SESSIONS:
+        with s.lock:
+            if s.engine is not None:
+                s.engine.direction = DIRECTION
     return {"ok": True, "direction": DIRECTION, "label": DIR_LABEL[DIRECTION]}
 
 
@@ -630,31 +748,33 @@ def api_thresh(req: ThreshReq):
             {"error": f"เกณฑ์ต้องอยู่ระหว่าง {THRESH_MIN} ถึง {THRESH_MAX}"},
             status_code=400)
     THRESH = float(v)
-    cfg = load_config()
-    cfg["thresh"] = THRESH
-    save_config(cfg)
-    with SES.lock:
-        if SES.engine is not None:
-            # engine อ่าน self.thresh ใหม่ทุกเฟรม → เปลี่ยนสดได้ ไม่ต้องสร้าง engine ใหม่
-            # (สร้างใหม่จะทำให้สล็อตที่ยึดไว้กับ hold timer รีเซ็ตหมดโดยไม่จำเป็น)
-            SES.engine.thresh = THRESH
+    update_config(thresh=THRESH)
+    for s in SESSIONS:
+        with s.lock:
+            if s.engine is not None:
+                # engine อ่าน self.thresh ใหม่ทุกเฟรม → เปลี่ยนสดได้ ไม่ต้องสร้าง engine ใหม่
+                # (สร้างใหม่จะทำให้สล็อตที่ยึดไว้กับ hold timer รีเซ็ตหมดโดยไม่จำเป็น)
+                s.engine.thresh = THRESH
     return {"ok": True, "thresh": THRESH}
 
 
 @app.post("/api/exposure")
 def api_exposure(req: ExposureReq):
-    ensure_camera()
+    ses = get_ses(req.cam)
+    if ses is None:
+        return _bad_cam(req.cam)
+    ensure_camera(ses)
     if _use_uvc():
         ok, msg = set_exposure(req.value)
         return {"ok": ok, "msg": msg}
     # OpenCV: ส่งให้ capture thread ตั้งให้ (กัน race กับ cap.read())
-    SES.exp_value = req.value
-    SES.exp_result = (False, "หมดเวลา — กล้องอาจยังไม่พร้อม ลองใหม่")
-    SES.exp_event.clear()
-    SES.exp_pending = True
-    SES.exp_event.wait(timeout=2.5)
-    ok, msg = SES.exp_result
-    return {"ok": ok, "msg": msg}
+    ses.exp_value = req.value
+    ses.exp_result = (False, "หมดเวลา — กล้องอาจยังไม่พร้อม ลองใหม่")
+    ses.exp_event.clear()
+    ses.exp_pending = True
+    ses.exp_event.wait(timeout=2.5)
+    ok, msg = ses.exp_result
+    return {"ok": ok, "msg": msg, "cam": req.cam}
 
 
 @app.get("/api/cameras")
@@ -668,22 +788,25 @@ def api_cameras():
       3. index ที่เหลือ probe พร้อมกันแบบขนาน — เวลารวม = ตัวที่ช้าที่สุด ไม่ใช่ผลรวม
     """
     names = _win_camera_names()
+    # index ที่แต่ละกล้องยึดอยู่ → บอกหน้าเว็บว่าตัวไหนถูกใช้เป็นกล้องที่ 1 / ที่ 2 แล้ว
+    used = {s.cam_index: s.slot for s in SESSIONS}
     # ถือ CAM_CTL ตลอดการสแกน — ระหว่างนี้ห้ามใครเปิด/ปิดกล้อง (/stream เรียก ensure_camera
     # ทุกครั้งที่โหลด ถ้าปล่อยให้แทรกได้จะกลายเป็นสองเธรดแย่ง device เดียวกันแล้ว OpenCV พัง)
     with CAM_CTL:
-        with SES.lock:
-            alive = SES.thread is not None and SES.thread.is_alive()
-            cur_frame = (SES.frame.copy()
-                         if (alive and SES.frame is not None) else None)
-            fx, fy = SES.flip_x, SES.flip_y
-        cur_index = CAM_INDEX
+        live = {}      # index -> (frame, fx, fy) ของกล้องที่กำลังเปิดและมีภาพอยู่แล้ว
+        for s in SESSIONS:
+            with s.lock:
+                alive = s.thread is not None and s.thread.is_alive()
+                has_frame = alive and s.frame is not None
+                if has_frame:
+                    live[s.cam_index] = (s.frame.copy(), s.flip_x, s.flip_y)
+            if not has_frame:
+                # ยังไม่มีภาพ → ปล่อยกล้องตัวนี้ก่อน ไม่งั้น probe index เดิมไม่ได้
+                stop_camera(s)
 
         scan = set(range(len(names) if names else SCAN_MAX_INDEX))
-        scan.add(cur_index)          # เผื่อ index ที่จำไว้อยู่นอกช่วงที่ OS รายงาน
-        if cur_frame is not None:
-            scan.discard(cur_index)  # ตัวนี้มีภาพสดอยู่แล้ว ไม่ต้องแตะ
-        else:
-            stop_camera()        # ยังไม่มีภาพ → ปล่อยกล้องก่อน ไม่งั้น probe index เดิมไม่ได้
+        scan.update(used)            # เผื่อ index ที่จำไว้อยู่นอกช่วงที่ OS รายงาน
+        scan -= set(live)            # ตัวที่มีภาพสดอยู่แล้ว ไม่ต้องแตะ
 
         found = {}
         targets = sorted(scan)
@@ -691,78 +814,120 @@ def api_cameras():
             with ThreadPoolExecutor(max_workers=min(6, len(targets))) as ex:
                 for i, res in zip(targets, ex.map(probe_cap, targets)):
                     found[i] = res
-        if cur_frame is not None:
-            found[cur_index] = (True, cur_frame)
-        ensure_camera()   # ถ้ากล้องเดิมยังเปิดอยู่ ฟังก์ชันนี้ไม่ทำอะไร
+        for i, (fr, _, _) in live.items():
+            found[i] = (True, fr)
+        ensure_all_cameras()   # กล้องที่ยังเปิดอยู่ ฟังก์ชันนี้ไม่ทำอะไร
 
+    # flip ของกล้องตัวแรกใช้เป็นค่าตั้งต้นให้ thumbnail ที่ยัง probe มาดิบๆ
+    fx0, fy0 = SESSIONS[0].flip_x, SESSIONS[0].flip_y
     cams = []
     for i in sorted(found):
         ok, fr = found[i]
         if ok and fr is not None:
             # เฟรมที่ยืมจากภาพสด กลับด้านมาแล้ว ที่ probe มาใหม่ต้องกลับให้ตรงกัน
-            if i != cur_index or cur_frame is None:
-                fr = _apply_flip(fr, fx, fy)
+            if i not in live:
+                fr = _apply_flip(fr, fx0, fy0)
             cams.append({"index": i, "thumb": _thumb(fr),
                          "name": names[i] if i < len(names) else "",
-                         "current": i == cur_index})
+                         "used_by": used.get(i, -1)})   # -1 = ยังไม่ถูกใช้
     # กล้องที่ OS เห็นแต่เปิดไม่ได้ (โปรแกรมอื่นยึดอยู่ / ถอดสายค้าง) — บอกผู้ใช้ไปตรงๆ
     busy = [{"index": i, "name": names[i]} for i in sorted(found)
             if not found[i][0] and i < len(names)]
-    return {"cameras": cams, "current": cur_index, "busy": busy}
+    return {"cameras": cams, "busy": busy,
+            "current": [s.cam_index for s in SESSIONS],
+            "n_cams": len(SESSIONS)}
 
 
 @app.post("/api/select_camera")
 def api_select_camera(req: CamReq):
-    global CAM_INDEX
+    ses = get_ses(req.cam)
+    if ses is None:
+        return _bad_cam(req.cam)
+    # กล้องสองตัวใช้ index เดียวกันไม่ได้ — DirectShow เปิดซ้ำตัวเดิมไม่ได้อยู่แล้ว
+    for s in SESSIONS:
+        if s is not ses and s.cam_index == req.index:
+            return JSONResponse(
+                {"error": f"index {req.index} ถูกใช้เป็นกล้องที่ {s.slot + 1} อยู่แล้ว "
+                          f"— เลือกตัวอื่น"}, status_code=400)
     # ปิด-สลับ-เปิด ต้องเป็นก้อนเดียว ไม่งั้น /stream ที่ยิงเข้ามาพอดีจะเปิดกล้อง "ตัวเก่า"
     # คืนมาคั่นกลาง แล้วเราไปเปิดตัวใหม่ทับ = สองเธรดถือกล้องพร้อมกัน
     with CAM_CTL:
-        stop_camera()
-        CAM_INDEX = req.index
-        cfg = load_config()
-        cfg["cam_index"] = req.index
-        save_config(cfg)
-        with SES.lock:
-            SES.engine = None   # กล้องเปลี่ยน — เริ่มตรวจใหม่ค่อยยึดสล็อตใหม่
-            SES.status = None
-            SES.jpeg = None
-            SES.frame = None
-            SES.cam_error = None   # ล้าง error ตัวเก่า ไม่งั้น wait_first_frame เชื่อค่าเก่า
-        ensure_camera()
+        stop_camera(ses)
+        ses.cam_index = req.index
+        save_sessions_config()
+        with ses.lock:
+            ses.engine = None   # กล้องเปลี่ยน — เริ่มตรวจใหม่ค่อยยึดสล็อตใหม่
+            ses.status = None
+            ses.jpeg = None
+            ses.frame = None
+            ses.cam_error = None   # ล้าง error ตัวเก่า ไม่งั้น wait_first_frame เชื่อค่าเก่า
+        ensure_camera(ses)
     # รอให้ภาพแรกมาก่อนค่อยตอบ หน้าเว็บจะได้ไม่รีโหลด /stream ตอนกล้องยังไม่พร้อม
-    ok = wait_first_frame()
-    with SES.lock:
-        err = SES.cam_error
-    return {"ok": ok, "index": req.index, "error": err}
+    ok = wait_first_frame(ses)
+    with ses.lock:
+        err = ses.cam_error
+    return {"ok": ok, "index": req.index, "cam": req.cam, "error": err}
+
+
+@app.post("/api/cam_count")
+def api_cam_count(req: CamCountReq):
+    """เพิ่ม/ลดจำนวนกล้องที่ใช้ (1 หรือ 2) — ต่อกล้องตัวที่สองแล้วค่อยกดเพิ่ม"""
+    global SESSIONS
+    n = req.count
+    if not 1 <= n <= MAX_CAMS:
+        return JSONResponse({"error": f"จำนวนกล้องต้องอยู่ระหว่าง 1 ถึง {MAX_CAMS}"},
+                            status_code=400)
+    with CAM_CTL:
+        if n < len(SESSIONS):
+            for s in SESSIONS[n:]:
+                stop_camera(s)
+            SESSIONS = SESSIONS[:n]
+        while len(SESSIONS) < n:
+            slot = len(SESSIONS)
+            used = {s.cam_index for s in SESSIONS}
+            # เดา index ที่ยังว่างให้ก่อน ผู้ใช้ค่อยกด "เลือกกล้อง" เปลี่ยนทีหลังได้
+            free = next((i for i in range(SCAN_MAX_INDEX) if i not in used), 0)
+            SESSIONS.append(Session(slot, cam_index=free))
+        save_sessions_config()
+        refs = load_references()
+        for s in SESSIONS:      # ค่าอ้างอิงของแต่ละกล้องอ่านกลับมาตาม slot
+            s.reference = refs[s.slot] if s.slot < len(refs) else None
+        ensure_all_cameras()
+    return {"ok": True, "n_cams": len(SESSIONS),
+            "cams": [s.cam_index for s in SESSIONS]}
 
 
 @app.post("/api/start")
 def api_start(req: StartReq):
+    """เริ่มตรวจทุกกล้องพร้อมกัน — แต่ละกล้องรับผิดชอบแผงคนละชุด
+    กล้อง 1 = แผง 1..pieces, กล้อง 2 = แผง pieces+1..pieces*2"""
+    global PIECES, PER_PIECE
     total = req.pieces * req.per_piece
     if req.pieces < 1 or req.per_piece < 1:
         return JSONResponse({"error": "จำนวนต้องมากกว่า 0"}, status_code=400)
     if total < 2:
-        return JSONResponse({"error": "ต้องมีอย่างน้อย 2 ดวงถึงเทียบกันได้"},
+        return JSONResponse({"error": "ต้องมีอย่างน้อย 2 ดวงถึงเทียบกันได้ (ต่อกล้อง)"},
                             status_code=400)
     if total > MAX_SPOTS:
         return JSONResponse(
-            {"error": f"รวม {total} ดวง เกินขีดจำกัด {MAX_SPOTS} ดวงต่อรอบ "
-                      f"(แบ่งเทสทีละไม่เกิน {MAX_SPOTS // req.per_piece} ชิ้น)"},
+            {"error": f"กล้องละ {total} ดวง เกินขีดจำกัด {MAX_SPOTS} ดวงต่อกล้อง "
+                      f"(แบ่งเทสทีละไม่เกิน {MAX_SPOTS // req.per_piece} ชิ้นต่อกล้อง)"},
             status_code=400)
-    ensure_camera()
+    ensure_all_cameras()
     # จำจำนวนที่ใช้ล่าสุด — เปิดโปรแกรมครั้งหน้าฟอร์มจะเติมให้เอง ไม่ต้องกรอกซ้ำ
-    cfg = load_config()
-    cfg["pieces"], cfg["per_piece"] = req.pieces, req.per_piece
-    save_config(cfg)
-    with SES.lock:
-        SES.pieces, SES.per_piece = req.pieces, req.per_piece
-        SES.status = None
-        SES.engine = MultiWatch(total, thresh=THRESH, reference=SES.reference,
-                                direction=DIRECTION)
-        direction = SES.engine.resolved_direction()
-    return {"ok": True, "total_spots": total,
-            "mode": "absolute" if SES.reference is not None else "relative",
-            "direction": direction}
+    PIECES, PER_PIECE = req.pieces, req.per_piece
+    update_config(pieces=req.pieces, per_piece=req.per_piece)
+    modes = []
+    for s in SESSIONS:
+        with s.lock:
+            s.status = None
+            s.engine = MultiWatch(total, thresh=THRESH, reference=s.reference,
+                                  direction=DIRECTION)
+            modes.append("absolute" if s.reference is not None else "relative")
+            direction = s.engine.resolved_direction()
+    return {"ok": True, "total_spots": total, "n_cams": len(SESSIONS),
+            "mode": "absolute" if all(m == "absolute" for m in modes) else "relative",
+            "modes": modes, "direction": direction}
 
 
 @app.post("/api/calibrate")
@@ -771,76 +936,70 @@ def api_calibrate(req: Optional[CalibrateReq] = None):
 
     body ว่างได้ (ของเดิมเรียกแบบไม่ส่ง body) → ตรวจความห่างตามปกติ"""
     check_spread = True if req is None else req.check_spread
-    with SES.lock:
-        engine = SES.engine
-        frame = SES.frame.copy() if SES.frame is not None else None
+    cam = 0 if req is None else req.cam
+    ses = get_ses(cam)
+    if ses is None:
+        return _bad_cam(cam)
+    with ses.lock:
+        engine = ses.engine
+        frame = ses.frame.copy() if ses.frame is not None else None
     if engine is None:
         return JSONResponse({"error": "กดเริ่มตรวจก่อน แล้วค่อย calibrate "
                                       "(ต้องรู้จำนวนจุดก่อน)"}, status_code=400)
     if frame is None:
-        return JSONResponse({"error": "ยังไม่มีภาพจากกล้อง"}, status_code=400)
+        return JSONResponse({"error": f"กล้องที่ {cam + 1} ยังไม่มีภาพ"},
+                            status_code=400)
     ref, msg = engine.calibrate(frame, check_spread=check_spread)
     if ref is None:
         return JSONResponse({"error": msg}, status_code=400)
-    with SES.lock:
-        SES.reference = ref
-    save_reference(ref)
-    return {"ok": True, "reference": round(ref, 2), "msg": msg,
+    with ses.lock:
+        ses.reference = ref
+    # เขียนทับเฉพาะช่องของกล้องนี้ ไม่แตะค่าอ้างอิงของอีกกล้อง
+    refs = load_references()
+    refs[ses.slot] = ref
+    save_references(refs)
+    return {"ok": True, "reference": round(ref, 2), "msg": msg, "cam": cam,
             "checked_spread": check_spread}
 
 
 @app.post("/api/calibrate/clear")
-def api_calibrate_clear():
-    """ล้างขาวอ้างอิง — กลับโหมดเทียบกันเอง"""
-    with SES.lock:
-        SES.reference = None
-        if SES.engine is not None:
-            SES.engine.reference = None
-    try:
-        os.remove(CALIB_FILE)
-    except OSError:
-        pass
-    return {"ok": True}
+def api_calibrate_clear(req: Optional[CalibrateReq] = None):
+    """ล้างขาวอ้างอิงของกล้องที่ระบุ — กลับโหมดเทียบกันเองเฉพาะกล้องนั้น"""
+    cam = 0 if req is None else req.cam
+    ses = get_ses(cam)
+    if ses is None:
+        return _bad_cam(cam)
+    with ses.lock:
+        ses.reference = None
+        if ses.engine is not None:
+            ses.engine.reference = None
+    refs = load_references()
+    refs[ses.slot] = None
+    if all(r is None for r in refs):
+        try:
+            os.remove(CALIB_FILE)     # ไม่เหลือค่าอ้างอิงเลย → ลบไฟล์ทิ้งเหมือนเดิม
+        except OSError:
+            pass
+    else:
+        save_references(refs)
+    return {"ok": True, "cam": cam}
 
 
 @app.post("/api/stop")
 def api_stop():
-    with SES.lock:
-        SES.engine = None  # กลับโหมดพรีวิว — กล้องยังเปิดอยู่ (จะปล่อยเองตอน idle)
-        SES.status = None
+    for s in SESSIONS:
+        with s.lock:
+            s.engine = None  # กลับโหมดพรีวิว — กล้องยังเปิดอยู่ (จะปล่อยเองตอน idle)
+            s.status = None
     return {"ok": True}
 
 
-@app.get("/api/status")
-def api_status():
-    with SES.lock:
-        st = SES.status
-        detecting = SES.detecting()
-        cam_error = SES.cam_error
-        fx, fy = SES.flip_x, SES.flip_y
-        # ทิศทางที่ engine ใช้จริงอยู่ (ถ้ากำลังตรวจ) ไม่ใช่ค่าที่ "จะใช้รอบหน้า"
-        eng = SES.engine
-        direction = eng.resolved_direction() if eng is not None \
-            else effective_direction(SES.reference)
-        saved_pieces, saved_per = SES.pieces, SES.per_piece
-    common = {"saved_pieces": saved_pieces, "saved_per_piece": saved_per,
-              "thresh": THRESH, "flip_x": fx, "flip_y": fy,
-              "direction": direction, "direction_label": DIR_LABEL[direction],
-              "direction_pinned": DIRECTION is not None}
-    if not detecting:
-        return dict(common, running=False, preview=True, cam_error=cam_error)
-    out = dict(common, running=True, pieces=SES.pieces, per_piece=SES.per_piece,
-               max_spots=MAX_SPOTS)
-    if st is None:
-        out["error"] = "กำลังเริ่มตรวจ..."
-        return out
-    if "error" in st:
-        out["error"] = st["error"]
-        return out
-    # จัดกลุ่มจุดเป็นรายชิ้น: ชิ้นที่ j = จุด (j-1)*per+1 .. j*per (ซ้าย→ขวา)
-    pieces = []
-    for j in range(SES.pieces):
-        spots = st["spots"][j * SES.per_piece:(j + 1) * SES.per_piece]
+def _pieces_from(st, per_piece, n_pieces, offset, cam):
+    """แปลง spots ของกล้องหนึ่งตัวเป็นรายการแผง พร้อมเลื่อนเลขแผงตามกล้อง
+    (กล้องที่ 2 เริ่มนับต่อจากกล้องที่ 1 เช่น 6-10 เมื่อกล้องละ 5 แผง)"""
+    out = []
+    for j in range(n_pieces):
+        spots = st["spots"][j * per_piece:(j + 1) * per_piece]
         sts = [s["state"] for s in spots]
         if "BAD" in sts:
             pstate = "BAD"
@@ -848,27 +1007,97 @@ def api_status():
             pstate = "INCOMPLETE"   # มีดวงหาย — ยังตัดสินไม่ครบ
         else:
             pstate = "OK"
-        pieces.append({"piece": j + 1, "state": pstate, "spots": spots})
-    out["pieces_detail"] = pieces
-    out["t"] = st["t"]
-    out["mode"] = st.get("mode", "relative")
-    out["ref"] = st.get("ref")
-    out["n_missing"] = st.get("n_missing", 0)
+        out.append({"piece": offset + j + 1, "state": pstate, "spots": spots,
+                    "cam": cam})
+    return out
+
+
+@app.get("/api/status")
+def api_status():
+    """สถานะรวมทุกกล้อง — ตารางผลเป็นชุดเดียวเรียงแผง 1..N ต่อเนื่องข้ามกล้อง
+
+    กล้องตัวไหนพัง ตัวที่เหลือยังตรวจต่อได้ แผงของกล้องที่พังจะขึ้นเป็น 'ไม่พบ'
+    พร้อม cam_error ของตัวนั้นบอกสาเหตุ"""
+    cams_info, pieces_all, errors = [], [], []
+    any_running = False
+    direction = effective_direction(SESSIONS[0].reference)
+    for s in SESSIONS:
+        with s.lock:
+            st, eng = s.status, s.engine
+            detecting = eng is not None
+            info = {"cam": s.slot, "index": s.cam_index,
+                    "flip_x": s.flip_x, "flip_y": s.flip_y,
+                    "cam_error": s.cam_error,
+                    "ref": round(s.reference, 2) if s.reference is not None else None,
+                    "mode": "absolute" if s.reference is not None else "relative",
+                    "running": detecting}
+            if eng is not None:
+                direction = eng.resolved_direction()
+        cams_info.append(info)
+        if s.cam_error:
+            errors.append(f"กล้องที่ {s.slot + 1}: {s.cam_error}")
+        if not detecting:
+            continue
+        any_running = True
+        offset = s.slot * PIECES
+        if st is None:
+            info["error"] = "กำลังเริ่มตรวจ..."
+        elif "error" in st:
+            info["error"] = st["error"]
+        else:
+            pieces_all.extend(_pieces_from(st, PER_PIECE, PIECES, offset, s.slot))
+            info["t"] = st["t"]
+            info["n_missing"] = st.get("n_missing", 0)
+
+    common = {"saved_pieces": PIECES, "saved_per_piece": PER_PIECE,
+              "thresh": THRESH, "n_cams": len(SESSIONS), "cams": cams_info,
+              "max_spots": MAX_SPOTS,
+              "direction": direction, "direction_label": DIR_LABEL[direction],
+              "direction_pinned": DIRECTION is not None,
+              # ค่าเดิมที่หน้าเว็บ/สคริปต์เก่าอ่าน — ยึดกล้องตัวแรกไว้เพื่อความเข้ากันได้
+              "flip_x": SESSIONS[0].flip_x, "flip_y": SESSIONS[0].flip_y,
+              "cam_error": SESSIONS[0].cam_error}
+    if not any_running:
+        return dict(common, running=False, preview=True)
+    out = dict(common, running=True, pieces=PIECES, per_piece=PER_PIECE)
+    if pieces_all:
+        out["pieces_detail"] = sorted(pieces_all, key=lambda p: p["piece"])
+        out["mode"] = ("absolute"
+                       if all(c["mode"] == "absolute" for c in cams_info)
+                       else "relative")
+        out["ref"] = cams_info[0]["ref"]
+    else:
+        out["error"] = next((c["error"] for c in cams_info if c.get("error")),
+                            "กำลังเริ่มตรวจ...")
+    if errors:
+        out["cam_errors"] = errors
     return out
 
 
 @app.get("/stream")
-def stream():
-    ensure_camera()
+def stream(cam: int = 0):
+    ses = get_ses(cam)
+    if ses is None:
+        return JSONResponse({"error": f"ไม่มีกล้องลำดับที่ {cam + 1}"},
+                            status_code=404)
+    ensure_camera(ses)
 
     def gen():
+        sent = False
         while True:
-            with SES.lock:
-                buf = SES.jpeg
-                SES.last_stream = time.time()   # บอกว่ายังมีคนดูอยู่ (D11)
+            with ses.lock:
+                buf = ses.jpeg
+                err = ses.cam_error
+                ses.last_stream = time.time()   # บอกว่ายังมีคนดูอยู่ (D11)
             if buf is None:
+                # กล้องเปิดไม่ได้และยังไม่เคยส่งภาพเลย → จบ stream ไปเลย
+                # ไม่งั้น <img> ฝั่งเบราว์เซอร์จะค้างรอจนหมดเวลา แล้วผู้ใช้ไม่รู้ว่าเกิดอะไร
+                # (หน้าเว็บมี cam_error จาก /api/status บอกสาเหตุอยู่แล้ว)
+                if err is not None and not sent:
+                    return
                 time.sleep(0.2)
                 continue
+            sent = True
             yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + buf + b"\r\n")
             time.sleep(0.1)  # ~10 fps พอสำหรับงานเฝ้าดู
     return StreamingResponse(gen(),
@@ -892,7 +1121,12 @@ PAGE = """<!doctype html>
          cursor: pointer; margin-left: 10px; }
   #btnStart { background: #2e7d32; color: #fff; }
   #btnStop  { background: #5a6270; color: #fff; }
-  #video { max-width: 100%; border-radius: 10px; display: block; }
+  #videos { display: flex; flex-wrap: wrap; gap: 12px; }
+  .vwrap { flex: 1 1 320px; min-width: 280px; }
+  .vwrap img { width: 100%; border-radius: 10px; display: block; background: #0b0d11; }
+  .vlabel { font-size: 14px; font-weight: 600; color: #9fb4d0; margin-bottom: 4px; }
+  .vwrap.off .vlabel { color: #ff6b6b; }
+  .verr { color: #ff6b6b; font-size: 13px; margin-top: 4px; min-height: 18px; }
   table { border-collapse: collapse; min-width: 340px; }
   th, td { padding: 8px 14px; text-align: center; border-bottom: 1px solid #2c333d; }
   .ok  { color: #6fdc8c; font-weight: 700; }
@@ -926,9 +1160,19 @@ PAGE = """<!doctype html>
   <div class="panel" style="flex:1 1 640px">
     <div id="controls">
       <div style="margin-bottom:10px">
+        <span style="font-weight:600">📺 ใช้กี่กล้อง:</span>
+        <select id="ncam" onchange="setCamCount(this.value)"
+                style="font-size:16px;padding:6px;border-radius:6px;border:1px solid #3a4250;background:#11141a;color:#e8eaed">
+          <option value="1">1 กล้อง</option>
+          <option value="2">2 กล้อง (แบ่งแผงคนละชุด)</option>
+        </select>
+        <span class="hint" id="ncamhint"></span>
+      </div>
+      <div id="camtabs" style="margin-bottom:10px"></div>
+      <div style="margin-bottom:10px">
         <button onclick="loadCams()" style="background:#3d5a80;color:#fff">📷 เลือกกล้อง</button>
         <button id="btnDoneCam" onclick="closeCamSelector()" style="background:#2e7d32;color:#fff;display:none">✅ เสร็จสิ้นการเลือกกล้อง</button>
-        <span class="hint">กล้องสลับ index เอง? กดปุ่มนี้แล้วคลิกภาพที่เห็นไฟ LED</span>
+        <span class="hint" id="pickhint">กล้องสลับ index เอง? กดปุ่มนี้แล้วคลิกภาพที่เห็นไฟ LED</span>
         <div id="cams"></div>
       </div>
       <label>จำนวนชิ้น <input type="number" id="pieces" value="1" min="1" max="5"></label>
@@ -985,7 +1229,18 @@ PAGE = """<!doctype html>
         ดวงที่หาไม่เจอจะขึ้น "ไม่พบ" — ดวงอื่นยังตรวจได้ปกติ</div>
       <div id="msg"></div>
     </div>
-    <img id="video" src="/stream" alt="กำลังต่อกล้อง...">
+    <div id="videos">
+      <div class="vwrap" id="vwrap0">
+        <div class="vlabel" id="vlabel0">กล้องที่ 1</div>
+        <img id="video0" src="/stream?cam=0" alt="กำลังต่อกล้อง...">
+        <div class="verr" id="verr0"></div>
+      </div>
+      <div class="vwrap" id="vwrap1" style="display:none">
+        <div class="vlabel" id="vlabel1">กล้องที่ 2</div>
+        <img id="video1" alt="กำลังต่อกล้อง...">
+        <div class="verr" id="verr1"></div>
+      </div>
+    </div>
   </div>
   <div class="panel" style="flex:0 1 420px">
     <h3 style="margin-top:4px">สถานะรายชิ้น (ซ้าย → ขวา)</h3>
@@ -1003,6 +1258,58 @@ PAGE = """<!doctype html>
 </main>
 <script>
 setInterval(poll, 1000);
+
+// ---- หลายกล้อง ----
+// activeCam = กล้องที่ปุ่มตั้งค่า (เลือกกล้อง/แสง/กลับภาพ/calibrate) จะไปมีผลด้วย
+let nCams = 1, activeCam = 0, camsInfo = [];
+
+async function setCamCount(n) {
+  n = +n;
+  const r = await (await fetch('/api/cam_count', {method:'POST',
+    headers:{'Content-Type':'application/json'}, body: JSON.stringify({count: n})})).json();
+  const hint = document.getElementById('ncamhint');
+  if (r.error) { hint.textContent = '⚠️ ' + r.error; return; }
+  hint.textContent = n > 1
+    ? 'กล้องที่ 2 รับแผงชุดถัดไป — อย่าลืมกด "เลือกกล้อง" ตั้ง index ให้ตัวที่ 2 ด้วย'
+    : '';
+  if (activeCam >= n) activeCam = 0;
+  applyCamCount(n);
+  // สตรีมของกล้องที่เพิ่งเพิ่ม ต้องสั่งโหลดเอง (cache-bust กันภาพเก่าค้าง)
+  for (let i = 0; i < n; i++) reloadStream(i);
+}
+
+function applyCamCount(n) {
+  nCams = n;
+  document.getElementById('ncam').value = n;
+  document.getElementById('vwrap1').style.display = n > 1 ? '' : 'none';
+  renderCamTabs();
+}
+
+function reloadStream(i) {
+  document.getElementById('video' + i).src = '/stream?cam=' + i + '&ts=' + Date.now();
+}
+
+function renderCamTabs() {
+  const box = document.getElementById('camtabs');
+  if (nCams < 2) { box.innerHTML = ''; return; }   // กล้องเดียวไม่ต้องมีแท็บให้รก
+  let h = '<span style="font-weight:600">⚙️ ตั้งค่ากล้อง:</span>';
+  for (let i = 0; i < nCams; i++) {
+    const on = i === activeCam;
+    h += `<button onclick="setActiveCam(${i})" style="background:${on ? '#3d5a80' : '#2a303a'};color:#fff">`
+       + `${on ? '● ' : ''}กล้องที่ ${i + 1}</button>`;
+  }
+  h += '<span class="hint">ปุ่มเลือกกล้อง / ปรับแสง / กลับภาพ / calibrate จะมีผลกับกล้องที่เลือกไว้</span>';
+  box.innerHTML = h;
+}
+
+function setActiveCam(i) {
+  activeCam = i;
+  renderCamTabs();
+  updateFlipUI();
+  document.getElementById('calinfo').textContent = '';
+  document.getElementById('msg').textContent = 'ตอนนี้กำลังตั้งค่ากล้องที่ ' + (i + 1);
+}
+
 async function loadCams() {
   document.getElementById('msg').textContent = 'กำลังสแกนกล้อง...';
   const j = await (await fetch('/api/cameras')).json();
@@ -1016,9 +1323,13 @@ async function loadCams() {
   for (const c of j.cameras) {
     const d = document.createElement('div');
     d.id = 'camcard-' + c.index;
-    d.className = 'camcard' + (c.current ? ' cur' : '');
+    const mine = c.used_by === activeCam;
+    d.className = 'camcard' + (mine ? ' cur' : '');
     d.dataset.name = c.name || ('กล้อง #' + c.index);
-    d.innerHTML = `<img src="${c.thumb}"><span>${d.dataset.name}${c.current?' (กำลังดูภาพสด)':''}</span>`;
+    // used_by บอกว่า index นี้ถูกกล้องตัวไหนยึดไว้ (-1 = ว่าง)
+    const tag = mine ? ' (ใช้อยู่)'
+              : (c.used_by >= 0 ? ` (เป็นกล้องที่ ${c.used_by + 1})` : '');
+    d.innerHTML = `<img src="${c.thumb}"><span>${d.dataset.name}${tag}</span>`;
     d.onclick = () => selectCam(c.index);
     box.appendChild(d);
   }
@@ -1031,39 +1342,38 @@ async function loadCams() {
     box.appendChild(d);
   }
   document.getElementById('btnDoneCam').style.display = 'inline-block';
-  document.getElementById('msg').textContent = j.cameras.length
-    ? 'คลิกเลือกกล้องเพื่อสลับดูภาพสดที่จอหลักได้ทันที — เมื่อพอใจแล้วกด "เสร็จสิ้น"'
-    : 'พบกล้องแต่เปิดไม่ได้สักตัว — ปิดโปรแกรมที่ใช้กล้องอยู่ (Teams/Zoom/OBS) แล้วกด "เลือกกล้อง" ใหม่';
+  document.getElementById('msg').textContent = !j.cameras.length
+    ? 'พบกล้องแต่เปิดไม่ได้สักตัว — ปิดโปรแกรมที่ใช้กล้องอยู่ (Teams/Zoom/OBS) แล้วกด "เลือกกล้อง" ใหม่'
+    : (nCams > 1 ? `คลิกเลือกกล้องให้ "กล้องที่ ${activeCam + 1}" — เสร็จแล้วกด "เสร็จสิ้น"`
+                 : 'คลิกเลือกกล้องเพื่อสลับดูภาพสดได้ทันที — เมื่อพอใจแล้วกด "เสร็จสิ้น"');
 }
 async function selectCam(i) {
   const card0 = document.getElementById('camcard-' + i);
   const nm = (card0 && card0.dataset.name) || ('กล้อง #' + i);
-  document.getElementById('msg').textContent = 'กำลังสลับเป็น ' + nm + '...';
+  const who = nCams > 1 ? `กล้องที่ ${activeCam + 1} = ` : '';
+  document.getElementById('msg').textContent = `กำลังตั้ง ${who}${nm}...`;
   const r = await (await fetch('/api/select_camera', {method:'POST',
-    headers:{'Content-Type':'application/json'}, body: JSON.stringify({index: i})})).json();
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({index: i, cam: activeCam})})).json();
   if (!r.ok) {
     document.getElementById('msg').textContent =
-      '⚠️ สลับเป็น ' + nm + ' ไม่สำเร็จ — ' + (r.error || 'กล้องไม่ส่งภาพ');
+      `⚠️ ตั้ง ${who}${nm} ไม่สำเร็จ — ` + (r.error || 'กล้องไม่ส่งภาพ');
     return;
   }
-
   const box = document.getElementById('cams');
-  const cards = box.getElementsByClassName('camcard');
-  for (let card of cards) {
+  for (let card of box.getElementsByClassName('camcard')) {
     card.classList.remove('cur');
     const span = card.querySelector('span');
-    if (span) span.textContent = span.textContent.replace(' (กำลังดูภาพสด)', '');
+    if (span) span.textContent = span.textContent.replace(/ \\(ใช้อยู่\\)$/, '');
   }
   const selCard = document.getElementById('camcard-' + i);
   if (selCard) {
     selCard.classList.add('cur');
     const span = selCard.querySelector('span');
-    if (span) span.textContent = `กล้อง #${i} (กำลังดูภาพสด)`;
+    if (span) span.textContent = nm + ' (ใช้อยู่)';
   }
-  document.getElementById('msg').textContent = '✅ สลับเป็นกล้อง #' + i + ' แล้ว (แสดงภาพสดที่จอหลักทันที)';
-
-  // รีโหลดภาพสดหน้าหลัก (cache-bust)
-  document.getElementById('video').src = '/stream?ts=' + Date.now();
+  document.getElementById('msg').textContent = `✅ ตั้ง ${who}${nm} แล้ว`;
+  reloadStream(activeCam);   // รีโหลดภาพสดของกล้องตัวนั้น (cache-bust)
 }
 function closeCamSelector() {
   document.getElementById('cams').innerHTML = '';
@@ -1085,31 +1395,37 @@ async function stop() {
   await fetch('/api/stop', {method:'POST'});
   document.getElementById('msg').textContent = '';
 }
+function camTag() { return nCams > 1 ? `[กล้องที่ ${activeCam + 1}] ` : ''; }
+
 async function calibrate() {
   const chk = document.getElementById('calspread').checked;
   const r = await fetch('/api/calibrate', {method:'POST',
     headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({check_spread: chk})});
+    body: JSON.stringify({check_spread: chk, cam: activeCam})});
   const j = await r.json();
   // เขียนลง calinfo (ช่องข้างปุ่ม calibrate) ไม่ใช่ msg ที่ปุ่มอื่นใช้ร่วมกัน
   // → ย้อมสีเตือนได้โดยไม่ไปติดค้างกับข้อความของปุ่มอื่น
   const el = document.getElementById('calinfo');
-  el.textContent = j.ok ? '✓ ' + j.msg : '✗ ' + j.error;
+  el.textContent = camTag() + (j.ok ? '✓ ' + j.msg : '✗ ' + j.error);
   el.style.color = !j.ok ? '#ff6b6b'
                  : (j.checked_spread ? '#6fdc8c' : '#ffb454');
   document.getElementById('msg').textContent = '';
 }
 async function clearCalib() {
-  await fetch('/api/calibrate/clear', {method:'POST'});
+  await fetch('/api/calibrate/clear', {method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({cam: activeCam})});
   const el = document.getElementById('calinfo');
-  el.textContent = 'ล้างอ้างอิงแล้ว — กลับโหมดเทียบกันเอง';
+  el.textContent = camTag() + 'ล้างอ้างอิงแล้ว — กลับโหมดเทียบกันเอง';
   el.style.color = '';
 }
 let expLevel = 5;            // ระดับแสงปัจจุบัน (น้อย = มืด) ตรงกับ DEFAULT_EXPOSURE ตอนเปิดกล้อง
 async function applyExp(v) {
   const j = await (await fetch('/api/exposure', {method:'POST',
-    headers:{'Content-Type':'application/json'}, body: JSON.stringify({value: v})})).json();
-  document.getElementById('msg').textContent = j.msg || (j.ok ? 'เรียบร้อย' : 'ลองใหม่อีกครั้ง');
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({value: v, cam: activeCam})})).json();
+  document.getElementById('msg').textContent =
+    camTag() + (j.msg || (j.ok ? 'เรียบร้อย' : 'ลองใหม่อีกครั้ง'));
 }
 function darker()   { expLevel = Math.max(1, Math.round(expLevel / 2));   applyExp(expLevel); }
 function brighter() { expLevel = Math.min(1000, Math.max(2, expLevel * 2)); applyExp(expLevel); }
@@ -1123,12 +1439,13 @@ async function toggleFlip(axis) {
   const r = await fetch('/api/flip', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({flip_x: newX, flip_y: newY})
+    body: JSON.stringify({flip_x: newX, flip_y: newY, cam: activeCam})
   });
   const j = await r.json();
   flipX = j.flip_x; flipY = j.flip_y;
   updateFlipUI();
-  document.getElementById('msg').textContent = `กลับภาพ: แกน X (ซ้าย-ขวา) = ${flipX ? 'เปิด' : 'ปิด'}, แกน Y (บน-ล่าง) = ${flipY ? 'เปิด' : 'ปิด'}`;
+  document.getElementById('msg').textContent = camTag() +
+    `กลับภาพ: แกน X (ซ้าย-ขวา) = ${flipX ? 'เปิด' : 'ปิด'}, แกน Y (บน-ล่าง) = ${flipY ? 'เปิด' : 'ปิด'}`;
 }
 function updateFlipUI() {
   const bx = document.getElementById('btnFlipX');
@@ -1199,13 +1516,37 @@ function applyThreshUI() {
   document.getElementById('thslider').value = thresh;
   document.getElementById('thnum').value = thresh;
 }
+function renderCamStatus(j) {
+  camsInfo = j.cams || [];
+  if (j.n_cams && j.n_cams !== nCams) {
+    if (activeCam >= j.n_cams) activeCam = 0;
+    applyCamCount(j.n_cams);
+    for (let i = 0; i < j.n_cams; i++) reloadStream(i);
+  }
+  const per = j.saved_per_piece || 2, pc = j.saved_pieces || 0;
+  for (const c of camsInfo) {
+    const lab = document.getElementById('vlabel' + c.cam);
+    const err = document.getElementById('verr' + c.cam);
+    const wrap = document.getElementById('vwrap' + c.cam);
+    if (!lab) continue;
+    // ป้ายบอกว่ากล้องนี้รับผิดชอบแผงหมายเลขไหน — ตรงกับตารางผลด้านขวา
+    const from = c.cam * pc + 1, to = (c.cam + 1) * pc;
+    const range = pc ? ` — แผง ${from}-${to}` : '';
+    const mode = c.ref !== null ? ` · อ้างอิง b*=${c.ref}` : ' · ยังไม่ calibrate';
+    lab.textContent = `กล้องที่ ${c.cam + 1}${range}${mode}`;
+    err.textContent = c.cam_error ? '⚠️ ' + c.cam_error : '';
+    if (wrap) wrap.className = 'vwrap' + (c.cam_error ? ' off' : '');
+  }
+}
+
 async function poll() {
   const j = await (await fetch('/api/status')).json();
-  if (j.flip_x !== undefined && j.flip_y !== undefined) {
-    if (flipX !== j.flip_x || flipY !== j.flip_y) {
-      flipX = j.flip_x; flipY = j.flip_y;
-      updateFlipUI();
-    }
+  renderCamStatus(j);
+  // flip เป็นค่าประจำกล้อง — เอาของกล้องที่กำลังตั้งค่าอยู่มาแสดงบนปุ่ม
+  const me = (j.cams || []).find(c => c.cam === activeCam);
+  if (me && (flipX !== me.flip_x || flipY !== me.flip_y)) {
+    flipX = me.flip_x; flipY = me.flip_y;
+    updateFlipUI();
   }
   // ดึงค่าเกณฑ์จริงจากเซิร์ฟเวอร์ครั้งแรก (และถ้ามีคนแก้จากอีกแท็บ) — แต่อย่าไปทับ
   // ตอนผู้ใช้กำลังลาก slider อยู่
@@ -1231,13 +1572,15 @@ async function poll() {
       : `จับ${j.direction_label} (ค่าเริ่มต้นตามโหมด — เลือกเองได้)`;
   }
   const el = document.getElementById('result');
+  const camWarn = (j.cam_errors || []).length
+    ? `<div class="hint" style="color:#ffb454">⚠️ ${j.cam_errors.join('<br>⚠️ ')}</div>` : '';
   if (!j.running) {
-    el.innerHTML = j.cam_error
-      ? '⚠️ ' + j.cam_error
-      : '📷 โหมดพรีวิว — กดเริ่มตรวจเมื่อจัดวางเสร็จ';
+    el.innerHTML = camWarn ||
+      (j.cam_error ? '⚠️ ' + j.cam_error
+                   : '📷 โหมดพรีวิว — กดเริ่มตรวจเมื่อจัดวางเสร็จ');
     return;
   }
-  if (j.error) { el.innerHTML = '⚠️ ' + j.error; return; }
+  if (j.error) { el.innerHTML = camWarn + '⚠️ ' + j.error; return; }
   const ngPieces = j.pieces_detail.filter(p => p.state === 'BAD').map(p => p.piece);
   const incPieces = j.pieces_detail.filter(p => p.state === 'INCOMPLETE').map(p => p.piece);
   let h;
@@ -1250,15 +1593,24 @@ async function poll() {
   const rule = j.direction === 'blue' ? `ต่ำกว่า −${j.thresh}`
              : j.direction === 'yellow' ? `เกิน +${j.thresh}`
              : `เกิน ±${j.thresh}`;
-  h += j.mode === 'absolute'
-    ? `<div class="hint">🎯 เทียบขาวอ้างอิง b*=${j.ref} — NG เมื่อ "ห่าง" ${rule} (จับ${j.direction_label})</div>`
-    : `<div class="hint">⚠️ ยังไม่ calibrate — เทียบกันเองในกลุ่ม NG เมื่อ "ห่าง" ${rule} (แม่นน้อยกว่า)</div>`;
+  h += camWarn;
+  if (nCams > 1) {
+    // แต่ละกล้องมีค่าอ้างอิงของตัวเอง — สรุปให้เห็นว่าตัวไหนอยู่โหมดไหน
+    const per = camsInfo.map(c => `กล้อง ${c.cam + 1}: `
+      + (c.ref !== null ? `อ้างอิง b*=${c.ref}` : 'เทียบกันเอง')).join(' · ');
+    h += `<div class="hint">🎯 NG เมื่อ "ห่าง" ${rule} (จับ${j.direction_label}) — ${per}</div>`;
+  } else {
+    h += j.mode === 'absolute'
+      ? `<div class="hint">🎯 เทียบขาวอ้างอิง b*=${j.ref} — NG เมื่อ "ห่าง" ${rule} (จับ${j.direction_label})</div>`
+      : `<div class="hint">⚠️ ยังไม่ calibrate — เทียบกันเองในกลุ่ม NG เมื่อ "ห่าง" ${rule} (แม่นน้อยกว่า)</div>`;
+  }
   // relative + สองทาง ตอน 2 ดวง: dev ของสองดวงเป็นภาพสะท้อนกัน → เด้ง NG พร้อมกันเสมอ
   if (j.mode !== 'absolute' && j.direction === 'both' && j.pieces * j.per_piece === 2)
     h += `<div class="hint" style="color:#ffb454">⚠️ โหมดเทียบกันเอง + จับสองทาง ที่ 2 ดวง
           จะขึ้น NG พร้อมกันทั้งคู่เสมอ แยกไม่ออกว่าดวงไหนผิด — เลือก "ฟ้าเท่านั้น"
           หรือ calibrate ก่อน</div>`;
-  h += '<table><tr><th>ชิ้นที่</th><th>ดวง</th><th>b*</th><th>ห่าง</th><th>K</th><th>ผล</th></tr>';
+  h += '<table><tr>' + (nCams > 1 ? '<th>กล้อง</th>' : '')
+     + '<th>ชิ้นที่</th><th>ดวง</th><th>b*</th><th>ห่าง</th><th>K</th><th>ผล</th></tr>';
   for (const p of j.pieces_detail) {
     const pcls = p.state==='BAD' ? 'bad' : (p.state==='INCOMPLETE' ? 'miss' : 'ok');
     const plabel = p.state==='BAD' ? 'NG' : (p.state==='INCOMPLETE' ? 'ไม่ครบ' : 'OK');
@@ -1277,8 +1629,11 @@ async function poll() {
         dcls = Math.abs(s.dev) >= j.thresh ? 'bad'
              : (Math.abs(s.dev) >= j.thresh * 0.75 ? 'near' : '');
       }
-      h += `<tr${row}>` + (k === 0 ?
-        `<td rowspan="${p.spots.length}" class="${pcls}">#${p.piece} ${plabel}</td>` : '');
+      h += `<tr${row}>`;
+      if (k === 0 && nCams > 1)
+        h += `<td rowspan="${p.spots.length}" class="hint">${(p.cam ?? 0) + 1}</td>`;
+      if (k === 0)
+        h += `<td rowspan="${p.spots.length}" class="${pcls}">#${p.piece} ${plabel}</td>`;
       h += `<td>${spotName((s.i - 1) % j.per_piece + 1, j.per_piece)}</td>` +
            `<td>${bstr}</td><td class="${dcls}">${dstr}</td><td>${kstr}</td>` +
            `<td class="${cls}">${verdict}</td></tr>`;
@@ -1336,10 +1691,13 @@ def index():
 
 
 def main():
-    global CAM_INDEX, EXPOSURE_INIT, THRESH, CAMERA_VIDPID, DIRECTION
+    global EXPOSURE_INIT, THRESH, CAMERA_VIDPID, DIRECTION
     p = argparse.ArgumentParser()
     p.add_argument("--cam", type=int, default=None,
-                   help="camera index (ไม่ใส่ = หาจาก VID/PID ก่อน แล้วค่อยใช้ค่าที่จำไว้/0)")
+                   help="camera index ของกล้องตัวแรก "
+                        "(ไม่ใส่ = หาจาก VID/PID ก่อน แล้วค่อยใช้ค่าที่จำไว้/0)")
+    p.add_argument("--cams", type=int, default=None, choices=range(1, MAX_CAMS + 1),
+                   help=f"ใช้กล้องกี่ตัว (1-{MAX_CAMS}) กล้องที่ 2 รับแผงชุดถัดไป; จำถาวร")
     p.add_argument("--vidpid", default=None,
                    help="ผูกกล้องด้วย VID:PID เช่น 0x291a:0x3369 (Windows) แทน index คงที่; จำถาวร")
     p.add_argument("--host", default="127.0.0.1")
@@ -1382,39 +1740,49 @@ def main():
                         args=(f"http://{ip}:{args.port}",)).start()
     cfg = load_config()
     if args.flip_x:
-        SES.flip_x = True
-        cfg["flip_x"] = True
-        save_config(cfg)
+        SESSIONS[0].flip_x = True
     if args.flip_y:
-        SES.flip_y = True
-        cfg["flip_y"] = True
-        save_config(cfg)
+        SESSIONS[0].flip_y = True
+    if args.flip_x or args.flip_y:
+        save_sessions_config()
+        cfg = load_config()
     # VID/PID ที่จะใช้ผูกกล้อง: --vidpid > ค่าใน config > ค่าเริ่มต้น (C200)
     CAMERA_VIDPID = args.vidpid or cfg.get("cam_vidpid") or C200_VID_PID
     if args.vidpid:
-        cfg["cam_vidpid"] = args.vidpid
-        save_config(cfg)
-    # เลือก index: --cam (ระบุตรงๆ) > หาจาก VID/PID (Windows) > ค่าที่จำไว้ > 0
+        update_config(cam_vidpid=args.vidpid)
+    # จำนวนกล้อง: --cams ชนะค่าที่จำไว้ (ต่อกล้องตัวที่สองแล้วสั่ง --cams 2 ครั้งเดียวพอ)
+    if args.cams is not None and args.cams != len(SESSIONS):
+        while len(SESSIONS) > args.cams:
+            SESSIONS.pop()
+        while len(SESSIONS) < args.cams:
+            slot = len(SESSIONS)
+            used = {s.cam_index for s in SESSIONS}
+            free = next((i for i in range(SCAN_MAX_INDEX) if i not in used), 0)
+            SESSIONS.append(Session(slot, cam_index=free))
+        refs = load_references()
+        for s in SESSIONS:
+            s.reference = refs[s.slot] if s.slot < len(refs) else None
+        save_sessions_config()
+    # เลือก index ของกล้องตัวแรก: --cam (ระบุตรงๆ) > หาจาก VID/PID (Windows) > ค่าที่จำไว้
     if args.cam is not None:
-        CAM_INDEX = args.cam
-    else:
+        SESSIONS[0].cam_index = args.cam
+        save_sessions_config()
+    elif len(SESSIONS) == 1:
+        # หาด้วย VID/PID เฉพาะตอนใช้กล้องเดียว — ถ้ามีสองตัวรุ่นเดียวกันจะแยกไม่ออก
         idx = find_index_by_vidpid(CAMERA_VIDPID)
         if idx is not None:
-            CAM_INDEX = idx
+            SESSIONS[0].cam_index = idx
             print(f"พบกล้อง VID/PID {CAMERA_VIDPID} ที่ index {idx}")
-        else:
-            CAM_INDEX = cfg.get("cam_index", 0)
+            save_sessions_config()
     EXPOSURE_INIT = None if args.exposure == 0 else args.exposure
     if args.thresh is not None:        # ระบุมา → ใช้ + จำถาวร
         THRESH = args.thresh
-        cfg["thresh"] = args.thresh
-        save_config(cfg)
+        update_config(thresh=args.thresh)
     else:                              # ไม่ระบุ → ใช้ค่าที่จำไว้ (หรือ default เดิม 4.0)
         THRESH = cfg.get("thresh", THRESH)
     if args.direction is not None:     # ระบุมา → ใช้ + จำถาวร
         DIRECTION = args.direction
-        cfg["direction"] = DIRECTION
-        save_config(cfg)
+        update_config(direction=args.direction)
     else:                              # ไม่ระบุ → ค่าที่จำไว้ (None = ตามพฤติกรรมเดิม)
         saved = cfg.get("direction")
         DIRECTION = saved if saved in DIRECTIONS else None
