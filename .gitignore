@@ -7,8 +7,8 @@ __pycache__/
 *.pyc
 
 # runtime/per-machine state (ตั้งค่าของแต่ละเครื่อง — ไม่ commit)
-config.json
-calibration.json
+# config.json
+# calibration.json
 
 # OS
 .DS_Store
