@@ -352,8 +352,10 @@ class Session:
         self.stop_flag = False
         self.cap = None        # cap ปัจจุบัน (ให้ A3 OpenCV ตั้ง property ได้ ใน thread นี้)
         self.engine = None     # None = โหมดพรีวิว (โชว์ภาพเฉยๆ ไม่ตรวจ)
-        self.pieces = 0
-        self.per_piece = 0
+        # จำนวนแผง × ดวงต่อแผง ที่ใช้ล่าสุด — จำไว้ข้าม session จะได้ไม่ต้องกรอกใหม่ทุกครั้ง
+        # (หน้างานตั้งค่าเดิมซ้ำๆ ทุกวัน) ค่าเริ่มต้นเท่ากับที่ฟอร์มเคยตั้งไว้
+        self.pieces = int(cfg.get("pieces", 1))
+        self.per_piece = int(cfg.get("per_piece", 2))
         self.jpeg = None       # เฟรมล่าสุด (bytes)
         self.status = None     # สถานะล่าสุด (dict, มี cct)
         self.frame = None      # เฟรมดิบล่าสุด (ก่อน annotate) — ใช้ตอน calibrate
@@ -748,6 +750,10 @@ def api_start(req: StartReq):
                       f"(แบ่งเทสทีละไม่เกิน {MAX_SPOTS // req.per_piece} ชิ้น)"},
             status_code=400)
     ensure_camera()
+    # จำจำนวนที่ใช้ล่าสุด — เปิดโปรแกรมครั้งหน้าฟอร์มจะเติมให้เอง ไม่ต้องกรอกซ้ำ
+    cfg = load_config()
+    cfg["pieces"], cfg["per_piece"] = req.pieces, req.per_piece
+    save_config(cfg)
     with SES.lock:
         SES.pieces, SES.per_piece = req.pieces, req.per_piece
         SES.status = None
@@ -816,7 +822,9 @@ def api_status():
         eng = SES.engine
         direction = eng.resolved_direction() if eng is not None \
             else effective_direction(SES.reference)
-    common = {"thresh": THRESH, "flip_x": fx, "flip_y": fy,
+        saved_pieces, saved_per = SES.pieces, SES.per_piece
+    common = {"saved_pieces": saved_pieces, "saved_per_piece": saved_per,
+              "thresh": THRESH, "flip_x": fx, "flip_y": fy,
               "direction": direction, "direction_label": DIR_LABEL[direction],
               "direction_pinned": DIRECTION is not None}
     if not detecting:
@@ -925,6 +933,7 @@ PAGE = """<!doctype html>
       </div>
       <label>จำนวนชิ้น <input type="number" id="pieces" value="1" min="1" max="5"></label>
       <label>ดวงต่อชิ้น <input type="number" id="per" value="2" min="1" max="4"></label>
+      <span class="hint" id="savedinfo"></span>
       <button id="btnStart" onclick="start()">▶ เริ่มตรวจ</button>
       <button id="btnStop" onclick="stop()">⏸ หยุด (กลับพรีวิว)</button>
       <div style="margin-top:10px">
@@ -1069,6 +1078,8 @@ async function start() {
     body: JSON.stringify({pieces, per_piece: per})});
   const j = await r.json();
   document.getElementById('msg').textContent = j.error || '';
+  if (j.ok) document.getElementById('savedinfo').textContent =
+    `(จำค่านี้แล้ว: ${pieces} ชิ้น × ${per} ดวง = ${pieces * per} ดวง)`;
 }
 async function stop() {
   await fetch('/api/stop', {method:'POST'});
@@ -1137,6 +1148,8 @@ function spotName(idx, per) {
   return 'ดวง ' + idx;
 }
 
+let formFilled = false;   // เติมฟอร์มจากค่าที่จำไว้แล้วหรือยัง (ทำครั้งเดียว)
+
 // ---- ทิศทางที่ถือว่า NG ----
 let direction = null;
 let dirBusy = false;
@@ -1199,6 +1212,15 @@ async function poll() {
   if (j.thresh !== undefined && !threshBusy && thresh !== j.thresh) {
     thresh = j.thresh;
     applyThreshUI();
+  }
+  // เติมจำนวนแผง/ดวงที่ใช้ล่าสุดกลับเข้าฟอร์ม — ทำครั้งเดียวตอนเปิดหน้า
+  // ห้ามเติมซ้ำทุกรอบ poll ไม่งั้นจะทับเลขที่ผู้ใช้กำลังพิมพ์อยู่
+  if (!formFilled && j.saved_pieces) {
+    formFilled = true;
+    document.getElementById('pieces').value = j.saved_pieces;
+    document.getElementById('per').value = j.saved_per_piece;
+    document.getElementById('savedinfo').textContent =
+      `(จำค่าล่าสุด: ${j.saved_pieces} ชิ้น × ${j.saved_per_piece} ดวง = ${j.saved_pieces * j.saved_per_piece} ดวง)`;
   }
   if (j.direction !== undefined && !dirBusy && direction !== j.direction) {
     direction = j.direction;
